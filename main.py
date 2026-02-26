@@ -1,12 +1,15 @@
 # main.py
-# Minimal “it works” pipeline: fetch news (Google News RSS) + US filings (SEC EDGAR) + telemetry.
-# No paid APIs required. Designed to prevent silent "news_fetched=0" / "filings_fetched=0".
+# Silent agent runner:
+# - Loads portfolio symbols (hardcoded or via holdings.json)
+# - Fetches: news (Google News RSS) + filings (SEC EDGAR, US only)
+# - Computes: energy thesis assessment (rule-based scoring)
+# - Outputs: one JSON file (no essays on screen). Prints nothing unless ERROR.
 
 from __future__ import annotations
 
 import os
-import time
 import json
+import time
 import traceback
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,7 +20,7 @@ import feedparser
 
 
 # ----------------------------
-# Telemetry / utilities
+# Telemetry / helpers
 # ----------------------------
 
 @dataclass
@@ -46,7 +49,11 @@ class Timer:
 
 def safe_err(e: Exception) -> str:
     s = "".join(traceback.format_exception_only(type(e), e)).strip()
-    return s[:400]
+    return s[:500]
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
 # ----------------------------
@@ -66,14 +73,12 @@ def fetch_news_google_rss(
     Returns (http_status, items)
     Each item: {published_at, source, title, url}
     """
-    # Ticker-only queries can be noisy. If you have company names, include them.
     if company_name:
-        q = f'("{symbol}" OR "{company_name}") (stock OR shares OR earnings OR guidance)'
+        q = f'("{symbol}" OR "{company_name}") (stock OR shares OR earnings OR guidance OR acquisition OR merger)'
     else:
         q = f'"{symbol}" stock'
 
     url = GOOGLE_NEWS_RSS.format(query=quote_plus(q))
-
     r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
     status = r.status_code
     if status != 200:
@@ -109,7 +114,7 @@ def fetch_news_google_rss(
 
 
 # ----------------------------
-# Filings provider: SEC EDGAR (no API key; needs User-Agent)
+# Filings provider: SEC EDGAR (no API key; needs real User-Agent)
 # ----------------------------
 
 SEC_TICKER_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -125,10 +130,6 @@ def sec_headers(user_agent: str) -> Dict[str, str]:
 
 
 def load_sec_cik_map(user_agent: str, timeout: int = 15) -> Tuple[Optional[int], Dict[str, str]]:
-    """
-    Loads SEC ticker->CIK mapping once per run.
-    Returns (http_status, map[ticker]=10-digit CIK string).
-    """
     r = requests.get(SEC_TICKER_CIK_URL, headers=sec_headers(user_agent), timeout=timeout)
     if r.status_code != 200:
         return r.status_code, {}
@@ -154,11 +155,10 @@ def fetch_latest_filings_sec(
     Returns (http_status, items)
     Each item: {type, filed_at, accession, report_date, primary_doc, url}
     """
-    t = symbol.upper().strip()
-    cik = cik_map.get(t)
+    tkr = symbol.upper().strip()
+    cik = cik_map.get(tkr)
     if not cik:
-        # Not in SEC map (non-US listing, ETF not in map, etc.)
-        return None, []
+        return None, []  # not supported / non-US / not in SEC map
 
     url = SEC_SUBMISSIONS_URL.format(cik=cik)
     r = requests.get(url, headers=sec_headers(user_agent), timeout=timeout)
@@ -204,32 +204,196 @@ def fetch_latest_filings_sec(
 
 
 # ----------------------------
-# Main pipeline
+# Thesis scoring (rule-based; no screen text)
 # ----------------------------
 
-def run(
-    symbols: List[str],
-    company_names: Optional[Dict[str, str]] = None,
-    max_news: int = 5,
-    max_filings: int = 6,
-) -> Dict[str, Any]:
+DEFAULT_THESIS_RULES = {
+    "version": "energy_thesis_v1",
+    "hard_excludes": {
+        "industries": ["Oil & Gas Refining & Marketing", "Refining"],
+        "tags": ["DOWNSTREAM_HEAVY", "REFINING"],
+    },
+    "weights": {
+        "segment_fit": 25,         # upstream/midstream/nuclear alignment
+        "gas_leverage": 20,
+        "capital_discipline": 20,
+        "balance_sheet": 15,
+        "cash_return": 15,
+        "geo_relevance": 5,
+    },
+    "thresholds": {
+        "net_debt_to_ebitda_good": 1.5,
+        "shareholder_yield_good": 0.08,
+    },
+}
+
+
+def load_rules(path: str = "thesis_rules.json") -> Dict[str, Any]:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return DEFAULT_THESIS_RULES
+
+
+def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Returns a status object similar to your JSON, plus telemetry.
+    facts = structured fields (best effort).
+    Required-ish keys (if missing, scorer uses neutral defaults):
+      - industry (str)
+      - tags (list[str]) e.g. UPSTREAM, MIDSTREAM, URANIUM, NUCLEAR, REFINING
+      - geo (str) e.g. US, CANADA, EU, OTHER
+      - revenue_mix_gas_pct (0..1)
+      - net_debt_to_ebitda (float)
+      - shareholder_yield (float)  # dividend+buyback / market cap, 0..1
+      - capex_growth_pct (float)   # <=0 good, high positive bad
     """
-    company_names = company_names or {}
+    industry = (facts.get("industry") or "").strip()
+    tags = set([str(x).upper() for x in (facts.get("tags") or [])])
+    geo = (facts.get("geo") or "OTHER").upper()
+
+    exclude_reasons: List[str] = []
+    for bad_ind in rules["hard_excludes"].get("industries", []):
+        if bad_ind.lower() in industry.lower():
+            exclude_reasons.append(f"industry:{bad_ind}")
+    for bad_tag in rules["hard_excludes"].get("tags", []):
+        if bad_tag.upper() in tags:
+            exclude_reasons.append(f"tag:{bad_tag.upper()}")
+
+    if exclude_reasons:
+        return {
+            "symbol": symbol,
+            "thesis_score": 0,
+            "pillar_scores": {},
+            "flags": [],
+            "exclude": True,
+            "exclude_reasons": exclude_reasons,
+        }
+
+    w = rules["weights"]
+    t = rules["thresholds"]
+    pillar: Dict[str, int] = {}
+    flags: List[str] = []
+
+    # Segment fit: upstream/midstream/nuclear/uranium are "in-thesis"
+    segment_fit = 0.0
+    if "UPSTREAM" in tags:
+        segment_fit = max(segment_fit, 1.0)
+    if "MIDSTREAM" in tags:
+        segment_fit = max(segment_fit, 0.85)
+    if "NUCLEAR" in tags or "URANIUM" in tags:
+        segment_fit = max(segment_fit, 1.0)
+        flags.append("NUCLEAR_BUCKET")
+
+    pillar["segment_fit"] = int(round(w["segment_fit"] * clamp(segment_fit, 0, 1)))
+
+    # Gas leverage
+    gas_pct = float(facts.get("revenue_mix_gas_pct") or 0.0)
+    if gas_pct >= 0.5:
+        flags.append("US_GAS_LEVERAGE" if geo == "US" else "GAS_LEVERAGE")
+    pillar["gas_leverage"] = int(round(w["gas_leverage"] * clamp(gas_pct, 0, 1)))
+
+    # Capital discipline proxy (capex growth)
+    capex_growth = facts.get("capex_growth_pct")
+    if capex_growth is None:
+        capex_score = 0.5
+    else:
+        # <=0 good; 50%+ growth -> 0
+        capex_score = 1.0 if capex_growth <= 0.0 else clamp(1.0 - (float(capex_growth) / 0.5), 0, 1)
+    pillar["capital_discipline"] = int(round(w["capital_discipline"] * capex_score))
+
+    # Balance sheet (net debt / EBITDA)
+    nde = facts.get("net_debt_to_ebitda")
+    if nde is None:
+        bs_score = 0.5
+    else:
+        nde = float(nde)
+        bs_score = 1.0 if nde <= t["net_debt_to_ebitda_good"] else clamp(t["net_debt_to_ebitda_good"] / nde, 0, 1)
+    pillar["balance_sheet"] = int(round(w["balance_sheet"] * bs_score))
+
+    # Cash return (shareholder yield)
+    sh_yield = facts.get("shareholder_yield")
+    if sh_yield is None:
+        cr_score = 0.4
+    else:
+        sh_yield = float(sh_yield)
+        cr_score = 1.0 if sh_yield >= t["shareholder_yield_good"] else clamp(sh_yield / t["shareholder_yield_good"], 0, 1)
+    pillar["cash_return"] = int(round(w["cash_return"] * cr_score))
+
+    # Geo relevance (simple; tweak later)
+    geo_score = 1.0 if geo in {"US", "CANADA"} else 0.7
+    pillar["geo_relevance"] = int(round(w["geo_relevance"] * geo_score))
+
+    total = int(sum(pillar.values()))
+    return {
+        "symbol": symbol,
+        "thesis_score": total,
+        "pillar_scores": pillar,
+        "flags": flags,
+        "exclude": False,
+        "exclude_reasons": [],
+    }
+
+
+# ----------------------------
+# Facts layer (you can replace with real fundamentals later)
+# ----------------------------
+
+def load_facts(path: str = "facts.json") -> Dict[str, Dict[str, Any]]:
+    """
+    Optional file you maintain/update:
+      {
+        "EQT": {"industry":"Oil & Gas E&P", "tags":["UPSTREAM"], "geo":"US", "revenue_mix_gas_pct":0.9, ...},
+        "EPD": {"industry":"Midstream", "tags":["MIDSTREAM"], "geo":"US", ...}
+      }
+    If missing, returns empty dict and scorer uses neutral defaults.
+    """
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def load_symbols() -> List[str]:
+    """
+    Option A: holdings.json with {"symbols":["EQT","DVN",...]}
+    Option B: set env SYMBOLS="EQT,DVN,EPD"
+    Option C: fallback hardcoded sample list.
+    """
+    if os.path.exists("holdings.json"):
+        with open("holdings.json", "r", encoding="utf-8") as f:
+            j = json.load(f)
+            syms = j.get("symbols") or []
+            return [str(x).upper().strip() for x in syms if str(x).strip()]
+
+    env_syms = os.getenv("SYMBOLS", "").strip()
+    if env_syms:
+        return [s.strip().upper() for s in env_syms.split(",") if s.strip()]
+
+    # Fallback sample
+    return ["EQT", "DVN", "EPD", "CCJ", "LEU", "SMR", "OKLO"]
+
+
+# ----------------------------
+# Runner (silent)
+# ----------------------------
+
+def run_agent() -> Dict[str, Any]:
+    symbols = load_symbols()
+    facts_db = load_facts()
+    rules = load_rules("thesis_rules.json")
+
+    # Optional: improves news queries (you can put this in facts.json too)
+    company_names = {sym: (facts_db.get(sym, {}).get("company_name")) for sym in symbols}
+    company_names = {k: v for k, v in company_names.items() if v}
 
     sec_user_agent = os.getenv("SEC_USER_AGENT", "").strip()
     if not sec_user_agent:
-        # SEC will block generic/non-contact UAs. Set SEC_USER_AGENT in env.
-        # We'll still run news; filings will likely be blocked or empty.
-        sec_user_agent = "MyStockAgent (set SEC_USER_AGENT env var)"
+        sec_user_agent = "MyStockAgent (set SEC_USER_AGENT env var)"  # may get blocked by SEC
 
     telemetry: List[Dict[str, Any]] = []
 
-    # Load SEC CIK map once
     cik_status, cik_map = load_sec_cik_map(sec_user_agent)
     if cik_status != 200:
-        # We'll proceed; SEC might be blocked. Telemetry will reveal it.
         cik_map = {}
 
     news_requested = len(symbols)
@@ -237,87 +401,51 @@ def run(
     news_fetched = 0
     filings_fetched = 0
 
-    # Optional: store fetched items (you can remove if you only need counts)
-    news_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
-    filings_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    results: Dict[str, Any] = {}
 
     for sym in symbols:
-        # NEWS
+        results[sym] = {"symbol": sym}
+
+        # --- Thesis scoring (always runs)
+        facts = facts_db.get(sym, {})
+        results[sym]["thesis"] = score_energy_thesis(sym, facts, rules)
+
+        # --- News
         with Timer() as t:
             try:
-                http_code, items = fetch_news_google_rss(
-                    sym,
-                    company_name=company_names.get(sym),
-                    max_items=max_news,
-                )
+                http_code, items = fetch_news_google_rss(sym, company_name=company_names.get(sym))
                 status = "ok" if items else "empty"
                 if items:
                     news_fetched += 1
-                    news_by_symbol[sym] = items
                 telemetry.append(
-                    FetchResult(
-                        symbol=sym,
-                        provider="google_rss",
-                        kind="news",
-                        status=status,
-                        http_code=http_code,
-                        elapsed_ms=t.elapsed_ms,
-                        items=len(items),
-                    ).to_dict()
+                    FetchResult(sym, "google_rss", "news", status, http_code, t.elapsed_ms, len(items)).to_dict()
                 )
+                results[sym]["news"] = items  # remove if you want ultra-compact output
             except Exception as e:
                 telemetry.append(
-                    FetchResult(
-                        symbol=sym,
-                        provider="google_rss",
-                        kind="news",
-                        status="error",
-                        elapsed_ms=t.elapsed_ms,
-                        error=safe_err(e),
-                    ).to_dict()
+                    FetchResult(sym, "google_rss", "news", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict()
                 )
+                results[sym]["news"] = []
 
-        # FILINGS
+        # --- Filings
         with Timer() as t:
             try:
-                http_code, items = fetch_latest_filings_sec(
-                    sym,
-                    cik_map=cik_map,
-                    user_agent=sec_user_agent,
-                    max_items=max_filings,
-                )
-
+                http_code, items = fetch_latest_filings_sec(sym, cik_map, sec_user_agent)
                 if http_code is None and not items:
                     status = "not_supported"
                 else:
                     status = "ok" if items else "empty"
-
                 if items:
                     filings_fetched += 1
-                    filings_by_symbol[sym] = items
-
                 telemetry.append(
-                    FetchResult(
-                        symbol=sym,
-                        provider="sec_edgar",
-                        kind="filings",
-                        status=status,
-                        http_code=http_code,
-                        elapsed_ms=t.elapsed_ms,
-                        items=len(items),
-                    ).to_dict()
+                    FetchResult(sym, "sec_edgar", "filings", status, http_code, t.elapsed_ms, len(items)).to_dict()
                 )
+                results[sym]["filings"] = items  # remove if you want ultra-compact output
             except Exception as e:
                 telemetry.append(
-                    FetchResult(
-                        symbol=sym,
-                        provider="sec_edgar",
-                        kind="filings",
-                        status="error",
-                        elapsed_ms=t.elapsed_ms,
-                        error=safe_err(e),
-                    ).to_dict()
+                    FetchResult(sym, "sec_edgar", "filings", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict()
                 )
+                results[sym]["filings"] = []
 
     status_obj: Dict[str, Any] = {
         "status": "ok",
@@ -328,36 +456,31 @@ def run(
         "filings_requested": filings_requested,
         "filings_fetched": filings_fetched,
         "telemetry": telemetry,
-        "news": news_by_symbol,         # remove if you don't want payload size
-        "filings": filings_by_symbol,   # remove if you don't want payload size
+        "results": results,
     }
 
-    # Guardrails: if you asked for news but got literally none, fail loudly
+    # Fail loudly if you requested news and got literally zero
     if news_requested > 0 and news_fetched == 0:
         status_obj["status"] = "error"
         status_obj["error"] = "News fetch returned zero across all symbols. Check telemetry (http_code/status/error)."
 
-    # Filings can be legitimately 0 if holdings are non-US, but warn anyway.
+    # Filings can be legitimately zero if most symbols are non-US; still warn
     if filings_requested > 0 and filings_fetched == 0:
         status_obj.setdefault("warnings", []).append(
-            "Filings fetched zero across all symbols. Could be non-US symbols or SEC blocked. Check telemetry and SEC_USER_AGENT."
+            "Filings fetched zero across all symbols. Could be non-US holdings or SEC blocked. Check telemetry and SEC_USER_AGENT."
         )
+
+    # Write output silently
+    out_path = os.getenv("OUTPUT_PATH", "agent_output.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(status_obj, f, ensure_ascii=False, indent=2)
 
     return status_obj
 
 
 if __name__ == "__main__":
-    # Replace this list with your mapped symbols from the portfolio.
-    # Quick smoke-test:
-    symbols = ["AAPL", "NVDA", "CCJ", "TSLA"]
-
-    # Optional: improves Google News results
-    company_names = {
-        "AAPL": "Apple",
-        "NVDA": "NVIDIA",
-        "CCJ": "Cameco",
-        "TSLA": "Tesla",
-    }
-
-    result = run(symbols, company_names=company_names)
-    print(json.dumps(result, indent=2))
+    # Silent by default: no prints.
+    # If something goes wrong, raise so your runner/CI sees it.
+    obj = run_agent()
+    if obj.get("status") == "error":
+        raise SystemExit(obj.get("error", "Agent failed"))
