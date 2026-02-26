@@ -1,7 +1,6 @@
 import os
 import json
 import uuid
-import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -13,19 +12,19 @@ from fastapi.responses import HTMLResponse, JSONResponse
 app = FastAPI(title="My AI Investing Agent")
 
 # ----------------------------
-# Config (Railway ENV VARS)
+# Config (ENV VARS on Railway)
 # ----------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()
-ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip()
+ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()   # eToro x-api-key
+ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip() # eToro x-user-key
 
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()       # optional
 
 STATE_PATH = "/tmp/investing_agent_state.json"
 
 ETORO_REAL_PNL_URL = "https://public-api.etoro.com/api/v1/trading/info/real/pnl"
-ETORO_INSTRUMENTS_META_URL = "https://public-api.etoro.com/api/v1/market-data/instruments"
+ETORO_SEARCH_URL = "https://public-api.etoro.com/api/v1/market-data/search"
 
 
 # ----------------------------
@@ -85,22 +84,15 @@ def pick_instrument_id(p: Dict[str, Any]) -> Optional[int]:
         return None
 
 
-def pick_cid(p: Dict[str, Any]) -> Optional[int]:
-    """
-    CID appears in your position keys. This is often the ID used by market-data metadata endpoints.
-    """
-    cid = p.get("CID") or p.get("cid") or p.get("Cid")
-    try:
-        return int(cid) if cid is not None else None
-    except Exception:
-        return None
-
-
-def chunk_list(items: List[int], size: int = 100) -> List[List[int]]:
-    return [items[i:i + size] for i in range(0, len(items), size)]
-
-
 def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    eToro PnL often returns:
+    {
+      "clientPortfolio": {
+        "positions": [...]
+      }
+    }
+    """
     if not isinstance(payload, dict):
         return []
     cp = payload.get("clientPortfolio") or payload.get("ClientPortfolio") or {}
@@ -113,7 +105,7 @@ def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
-    Aggregate lots into unique instrumentID buckets, but carry CID for mapping.
+    Groups lots into unique instruments by instrumentID.
     """
     buckets = defaultdict(list)
     for p in raw_positions:
@@ -127,12 +119,8 @@ def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tu
         total_initial_usd = sum(float(pick_initial_usd(x) or 0) for x in lots)
         total_unreal_pnl = sum(float(pick_unrealized_pnl(x) or 0) for x in lots)
 
-        # Use CID from first lot (should be same for all lots of same instrument)
-        cid = pick_cid(lots[0]) if lots else None
-
         aggregated.append({
-            "instrumentID": iid,   # your lot grouping key
-            "CID": cid,            # mapping key
+            "instrumentID": iid,
             "lots": len(lots),
             "initialAmountInDollars": total_initial_usd,
             "unrealizedPnL": total_unreal_pnl,
@@ -140,12 +128,47 @@ def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tu
 
     aggregated.sort(key=lambda x: x.get("initialAmountInDollars", 0) or 0, reverse=True)
 
-    stats = {"lots_count": len(raw_positions), "unique_instruments_count": len(aggregated)}
+    stats = {
+        "lots_count": len(raw_positions),
+        "unique_instruments_count": len(aggregated),
+    }
     return aggregated, stats
 
 
+def build_portfolio_rows(agg: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    For now: ticker column shows the numeric instrumentID (until we map).
+    """
+    total_initial = sum(float(x.get("initialAmountInDollars") or 0) for x in agg) or 0.0
+    rows: List[Dict[str, Any]] = []
+
+    for a in agg:
+        iid = a.get("instrumentID")
+        initial = normalize_number(a.get("initialAmountInDollars"))
+        unreal = normalize_number(a.get("unrealizedPnL"))
+
+        weight_pct = None
+        if total_initial > 0 and initial is not None and initial > 0:
+            weight_pct = (initial / total_initial) * 100.0
+
+        pnl_pct = None
+        if unreal is not None and initial is not None and initial != 0:
+            pnl_pct = (unreal / initial) * 100.0
+
+        rows.append({
+            "ticker": str(iid) if iid is not None else "NA",
+            "lots": str(a.get("lots", "")),
+            "weight_pct": f"{weight_pct:.2f}" if weight_pct is not None else "",
+            "pnl_pct": f"{pnl_pct:.2f}" if pnl_pct is not None else "",
+            "thesis_score": "",
+            "tech_status": "",
+        })
+
+    return rows
+
+
 # ----------------------------
-# eToro HTTP
+# eToro calls
 # ----------------------------
 def etoro_headers() -> Dict[str, str]:
     if not ETORO_API_KEY or not ETORO_USER_KEY:
@@ -174,117 +197,20 @@ async def etoro_get_real_pnl() -> Dict[str, Any]:
         return r.json()
 
 
-def _parse_instrument_meta_response(data: Any) -> Dict[int, Dict[str, Any]]:
-    """
-    Expected:
-      {"instrumentDisplayDatas":[{"instrumentID":..., "symbolFull":"EQT", ...}, ...]}
-    We'll accept instrumentId or instrumentID in response.
-    """
-    out: Dict[int, Dict[str, Any]] = {}
-    if not isinstance(data, dict):
-        return out
-    items = data.get("instrumentDisplayDatas") or []
-    if not isinstance(items, list):
-        return out
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        raw_id = it.get("instrumentID") or it.get("instrumentId")
-        try:
-            iid = int(raw_id)
-        except Exception:
-            continue
-        out[iid] = it
-    return out
-
-
-async def etoro_get_instruments_metadata_by_cid(cids: List[int]) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
-    """
-    Fetch metadata for CIDs via:
-      GET /market-data/instruments?instrumentIds=<repeated>
-    We use repeated params because comma version gave 500 for you.
-    Returns:
-      meta_map[cid] = instrumentDisplayData
-      debug dict
-    """
-    debug: Dict[str, Any] = {"requested": len(cids), "batches": [], "total_mapped": 0}
-    out: Dict[int, Dict[str, Any]] = {}
-
-    if not cids:
-        return out, debug
-
-    batches = chunk_list(sorted(set(int(x) for x in cids)), size=100)
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        for batch in batches:
-            params = [("instrumentIds", str(i)) for i in batch]  # repeated params
-            r = await client.get(ETORO_INSTRUMENTS_META_URL, headers=etoro_headers(), params=params)
-
-            parsed: Dict[int, Dict[str, Any]] = {}
-            err = None
-            data = None
-            try:
-                data = r.json()
-                parsed = _parse_instrument_meta_response(data)
-            except Exception as e:
-                err = str(e)
-
-            debug["batches"].append({
-                "status": r.status_code,
-                "requested_count": len(batch),
-                "returned_count": len(parsed),
-                "error": err,
-                "sample_keys": list(data.keys())[:10] if isinstance(data, dict) else str(type(data)),
-                "sample_first_item": (data.get("instrumentDisplayDatas", [{}])[0] if isinstance(data, dict) else None),
-            })
-
-            if r.status_code == 200 and parsed:
-                out.update(parsed)
-
-    debug["total_mapped"] = len(out)
-    return out, debug
-
-
-def build_portfolio_rows(agg: List[Dict[str, Any]], cid_meta_map: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    total_initial = sum(float(x.get("initialAmountInDollars") or 0) for x in agg) or 0.0
-
-    rows: List[Dict[str, Any]] = []
-    for a in agg:
-        cid = a.get("CID")
-        meta = cid_meta_map.get(int(cid)) if cid is not None else None
-        symbol = (meta.get("symbolFull") if isinstance(meta, dict) else None) or ""
-
-        initial = normalize_number(a.get("initialAmountInDollars"))
-        unreal = normalize_number(a.get("unrealizedPnL"))
-
-        weight_pct = (initial / total_initial * 100.0) if (total_initial > 0 and initial and initial > 0) else None
-        pnl_pct = (unreal / initial * 100.0) if (initial and initial != 0 and unreal is not None) else None
-
-        ticker_display = symbol.strip() if symbol else (str(cid) if cid is not None else str(a.get("instrumentID", "")))
-
-        rows.append({
-            "ticker": ticker_display,
-            "lots": str(a.get("lots", "")),
-            "weight_pct": f"{weight_pct:.2f}" if weight_pct is not None else "",
-            "pnl_pct": f"{pnl_pct:.2f}" if pnl_pct is not None else "",
-            "thesis_score": "",
-            "tech_status": "",
-            "CID": str(cid) if cid is not None else "",
-            "instrumentID": str(a.get("instrumentID", "")),
-        })
-
-    return rows
-
-
 # ----------------------------
 # OpenAI brief (optional)
 # ----------------------------
 async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
+    """
+    Safe/read-only. If OpenAI quota isn't active, you'll see the error message.
+    """
     if not OPENAI_API_KEY:
         return "OpenAI key not set. (Skipping AI brief.)"
 
     top = portfolio_rows[:25]
-    lines = [f"{r['ticker']}: weight={r['weight_pct']}% pnl={r['pnl_pct']}%" for r in top]
+    lines = []
+    for r in top:
+        lines.append(f"{r['ticker']}: weight={r['weight_pct']}% pnl={r['pnl_pct']}%")
     portfolio_text = "\n".join(lines) if lines else "(no positions)"
 
     prompt = (
@@ -294,8 +220,15 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
         f"Portfolio:\n{portfolio_text}\n"
     )
 
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    body = {"model": "gpt-5-mini", "input": prompt, "max_output_tokens": 500}
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": "gpt-5-mini",
+        "input": prompt,
+        "max_output_tokens": 500,
+    }
 
     async with httpx.AsyncClient(timeout=45) as client:
         r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=body)
@@ -324,8 +257,6 @@ async def dashboard():
     portfolio = state.get("positions") or []
     stats = state.get("stats") or {}
     ai_brief = state.get("ai_brief") or ""
-
-    mapped = state.get("mapping_stats", {}).get("mapped_symbols", "")
 
     def bullets(items: List[str]) -> str:
         lis = "".join([f"<li>{x}</li>" for x in items]) if items else "<li>None</li>"
@@ -362,7 +293,7 @@ async def dashboard():
       <body>
         <h1>My AI Investing Agent</h1>
         <p><b>Last update:</b> {last_update}</p>
-        <p><b>eToro:</b> Lots = {stats.get("lots_count","")} | Unique instruments = {stats.get("unique_instruments_count","")} | Mapped tickers = {mapped}</p>
+        <p><b>eToro:</b> Lots = {stats.get("lots_count","")} | Unique instruments = {stats.get("unique_instruments_count","")}</p>
 
         <h2>Material Events</h2>
         {bullets(material_events)}
@@ -379,7 +310,8 @@ async def dashboard():
         <pre style="white-space: pre-wrap; background:#fafafa; border:1px solid #eee; padding:12px;">{ai_brief or "No brief yet. Run /tasks/daily."}</pre>
 
         <h2>Portfolio (unique instruments)</h2>
-        <p><i>Mapping uses CID → symbolFull. Debug: <code>/debug/mapping-last</code></i></p>
+        <p><i>Note: ticker is numeric instrumentID for now. Next: map to EQT/CCJ...</i></p>
+
         <table>
           <thead>
             <tr>
@@ -395,6 +327,11 @@ async def dashboard():
             {rows_html}
           </tbody>
         </table>
+
+        <p>
+          API: <code>/api/portfolio</code> • <code>/api/daily-brief</code><br/>
+          Debug: <code>/debug/positions-sample</code> • <code>/debug/resolve/EQT</code>
+        </p>
       </body>
     </html>
     """
@@ -419,6 +356,7 @@ async def run_daily():
         payload = await etoro_get_real_pnl()
         raw_positions = extract_positions(payload)
         agg_positions, stats = aggregate_positions_by_instrument(raw_positions)
+
         material_events.append(
             f"Pulled eToro successfully. Lots: {stats['lots_count']} | Unique instruments: {stats['unique_instruments_count']}"
         )
@@ -435,19 +373,13 @@ async def run_daily():
         save_state(state)
         return {"status": "error", "detail": e.detail}
 
-    # Collect CIDs for mapping
-    cids = [int(x["CID"]) for x in agg_positions if x.get("CID") is not None]
+    # Build aggregated rows for UI/API
+    portfolio_rows = build_portfolio_rows(agg_positions)
 
-    # Fetch CID metadata (this is the key fix)
-    cid_meta_map, meta_debug = await etoro_get_instruments_metadata_by_cid(cids)
+    technical_exceptions.append("Next: determine correct ID field for mapping tickers via debug endpoints.")
+    technical_exceptions.append("Then: add RSI/MACD/MAs/Volume/ADV + liquidity flags.")
 
-    # Build portfolio rows with mapped tickers
-    portfolio_rows = build_portfolio_rows(agg_positions, cid_meta_map)
-
-    mapped_symbols = sum(1 for r in portfolio_rows if r.get("ticker") and not str(r["ticker"]).isdigit())
-    material_events.append(f"CID metadata mapped: {len(cid_meta_map)}. Symbols mapped: {mapped_symbols}/{len(portfolio_rows)}.")
-
-    technical_exceptions.append("Next: RSI/MACD/MAs/Volume/ADV + liquidity flags.")
+    # AI brief (may error if quota not active)
     ai_brief = await generate_openai_brief(portfolio_rows) if portfolio_rows else "No positions."
 
     state.update({
@@ -458,8 +390,6 @@ async def run_daily():
         "positions": portfolio_rows,
         "stats": stats,
         "ai_brief": ai_brief,
-        "mapping_stats": {"mapped_symbols": mapped_symbols, "total": len(portfolio_rows), "cids": len(cids)},
-        "meta_last_debug": meta_debug,
     })
     save_state(state)
 
@@ -467,7 +397,6 @@ async def run_daily():
         "status": "ok",
         "lots": stats["lots_count"],
         "unique_instruments": stats["unique_instruments_count"],
-        "mapped_symbols": mapped_symbols,
     }
 
 
@@ -494,10 +423,49 @@ async def api_daily_brief():
     })
 
 
-@app.get("/debug/mapping-last")
-async def debug_mapping_last():
+# ----------------------------
+# NEW DEBUG ENDPOINTS (ID mapping)
+# ----------------------------
+@app.get("/debug/positions-sample")
+async def debug_positions_sample():
     """
-    Shows the last metadata fetch debug so we can see how many CIDs returned.
+    Shows a safe sample of the first 10 raw lots with ID fields only.
+    This tells us which ID should be used for mapping.
     """
-    state = load_state()
-    return JSONResponse(state.get("meta_last_debug") or {"note": "Run /tasks/daily first."})
+    payload = await etoro_get_real_pnl()
+    positions = extract_positions(payload)
+
+    sample = []
+    for p in positions[:10]:
+        sample.append({
+            "instrumentID": p.get("instrumentID"),
+            "CID": p.get("CID"),
+            "positionID": p.get("positionID"),
+            "mirrorID": p.get("mirrorID"),
+            "parentPositionID": p.get("parentPositionID"),
+            "orderID": p.get("orderID"),
+            "orderType": p.get("orderType"),
+        })
+
+    return {"count": len(positions), "sample_first_10": sample}
+
+
+@app.get("/debug/resolve/{ticker}")
+async def debug_resolve_ticker(ticker: str):
+    """
+    Tries to resolve a ticker via eToro market-data search.
+    This returns instrumentId/internalInstrumentId so we can compare to your PnL IDs.
+    """
+    params = {
+        "internalSymbolFull": ticker.upper(),
+        "fields": "instrumentId,internalInstrumentId,internalSymbolFull,displayname",
+        "pageSize": "5",
+        "pageNumber": "1",
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(ETORO_SEARCH_URL, headers=etoro_headers(), params=params)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"text": r.text}
+        return {"status": r.status_code, "data": data}
