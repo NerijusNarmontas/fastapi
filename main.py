@@ -4,8 +4,7 @@ import os
 import json
 from datetime import datetime, timezone
 import uuid
-
-import requests  # make sure requests is in requirements.txt
+import requests
 
 
 app = FastAPI()
@@ -35,6 +34,14 @@ def save_json(path: str, payload):
     ensure_dir()
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def safe_first_keys(obj, max_keys=60):
+    """Return only top-level keys (no values) to avoid leaking sensitive data."""
+    if not isinstance(obj, dict):
+        return {"type": str(type(obj))}
+    keys = list(obj.keys())[:max_keys]
+    return {"keys": keys, "total_keys": len(obj.keys())}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -98,20 +105,22 @@ def dashboard():
         <div class="card">
           <h2>Action Required</h2>
           <ul>{li(brief.get("action_required", []))}</ul>
-          <div class="muted">Run <code>/tasks/daily</code> once to refresh data.</div>
+          <div class="muted">Run <code>/tasks/daily</code> to refresh data.</div>
         </div>
 
         <div class="card">
           <h2>Portfolio</h2>
           <table>
             <thead>
-              <tr><th>Ticker</th><th>Weight %</th><th>P&L %</th><th>Thesis</th><th>Tech</th></tr>
+              <tr><th>Ticker</th><th>Weight %</th><th>P&amp;L %</th><th>Thesis</th><th>Tech</th></tr>
             </thead>
             <tbody>
               {rows if rows else "<tr><td colspan='5'>No positions saved yet.</td></tr>"}
             </tbody>
           </table>
-          <div class="muted">Note: ticker may show instrumentId until we map instrumentId → symbol.</div>
+          <div class="muted">
+            If ticker shows NA, open <code>/debug/position-keys</code> to see which field names eToro returns (keys only).
+          </div>
         </div>
 
         <div class="muted">API: <code>/api/daily-brief</code> • <code>/api/portfolio</code></div>
@@ -133,9 +142,21 @@ def api_portfolio():
     return load_json(PORTFOLIO_PATH, {"date": now_utc(), "positions": []})
 
 
+@app.get("/debug/position-keys")
+def debug_position_keys():
+    """
+    Shows only key names from the first raw position object (no values).
+    This helps us map the right field to ticker/symbol without leaking sensitive info.
+    """
+    portfolio = load_json(PORTFOLIO_PATH, {"date": now_utc(), "positions": [], "raw_first_position_keys": None})
+    return {
+        "note": "This shows only keys, not values.",
+        "raw_first_position_keys": portfolio.get("raw_first_position_keys"),
+    }
+
+
 @app.get("/tasks/daily")
 def run_daily_task():
-    # Key presence checks (does not reveal secrets)
     openai_ok = bool(os.getenv("OPENAI_API_KEY"))
 
     etoro_api_key = os.getenv("ETORO_API_KEY", "")
@@ -151,13 +172,12 @@ def run_daily_task():
 
     if not etoro_ok:
         brief["action_required"].append(
-            "Add both Railway variables: ETORO_API_KEY (Public Key) and ETORO_USER_KEY (Generated Key)."
+            "Add Railway variables: ETORO_API_KEY (Public Key) and ETORO_USER_KEY (Generated Key with Read Real)."
         )
         save_json(PORTFOLIO_PATH, portfolio)
         save_json(BRIEF_PATH, brief)
         return {"status": "ok", "message": "Daily task executed (missing eToro keys)."}
 
-    # Real eToro endpoint (from your docs screenshot)
     url = "https://public-api.etoro.com/api/v1/trading/info/real/pnl"
     headers = {
         "x-api-key": etoro_api_key,
@@ -170,10 +190,9 @@ def run_daily_task():
 
         if r.status_code != 200:
             brief["material_events"].append(f"eToro API error: HTTP {r.status_code}")
-            # show only a small snippet to avoid dumping sensitive info
             brief["material_events"].append(r.text[:300])
             brief["action_required"].append(
-                "Check eToro key permissions: Generated Key must have Read (Real)."
+                "Check eToro permissions: Generated Key must have Read (Real)."
             )
         else:
             data = r.json()
@@ -184,26 +203,43 @@ def run_daily_task():
                 f"Pulled eToro portfolio successfully. Positions: {len(positions)}"
             )
 
-            # Minimal mapping for dashboard table
+            # Save keys-only view of the first raw position to help mapping (no values)
+            if positions:
+                portfolio["raw_first_position_keys"] = safe_first_keys(positions[0])
+
             mapped = []
             for p in positions:
+                # Improved ticker mapping (tries common places)
+                ticker = (
+                    p.get("symbol")
+                    or p.get("ticker")
+                    or p.get("instrumentId")
+                    or p.get("InstrumentId")
+                    or (p.get("instrument") or {}).get("symbol")
+                    or (p.get("instrument") or {}).get("ticker")
+                    or (p.get("instrument") or {}).get("id")
+                    or (p.get("position") or {}).get("instrumentId")
+                    or (p.get("position") or {}).get("symbol")
+                    or (p.get("position") or {}).get("ticker")
+                    or "NA"
+                )
+
                 mapped.append(
                     {
-                        # We'll map this to ticker symbol later
-                        "ticker": str(p.get("instrumentId") or p.get("cid") or "NA"),
+                        "ticker": str(ticker),
                         "weight_pct": "",
                         "pnl_pct": "",
                         "thesis_score": "",
                         "tech_status": "",
                     }
                 )
+
             portfolio["positions"] = mapped
 
     except Exception as e:
         brief["material_events"].append(f"eToro request failed: {type(e).__name__}: {e}")
         brief["action_required"].append("Open Railway Logs to see details.")
 
-    # Placeholder until we add real technicals + OpenAI summary
     brief["technical_exceptions"].append(
         "Next: compute RSI/MACD/MAs/Volume/ADV per ticker + generate AI brief."
     )
