@@ -11,11 +11,11 @@ from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# GOAL (your requirements)
-# - NO crypto (stocks/ETFs only)
-# - Technicals computed reliably
-# - Always works even if eToro "ticker reverse mapping" changes:
-#   -> tries multiple mapping methods + shows debug
+# CONFIG / GOALS
+# - Stocks only (crypto excluded)
+# - Technicals computed (RSI/MACD/SMA + liquidity flags)
+# - Primary candles: Stooq (free)
+# - Fallback candles: eToro by instrumentId (more robust, fixes non-US + Stooq outages)
 # ============================================================
 
 app = FastAPI(title="My AI Investing Agent")
@@ -36,39 +36,30 @@ EXCLUDE_CRYPTO = os.getenv("EXCLUDE_CRYPTO", "true").strip().lower() in ("1", "t
 CRYPTO_DENY = {
     x.strip().upper()
     for x in os.getenv(
+        # NOTE: CRO added (your debug showed CRO slipping through).
         "CRYPTO_DENY",
-        "BTC,ETH,SOL,ADA,XRP,DOT,AVAX,LINK,OP,RUNE,WLD,JTO,ARB,ATOM,NEAR,APT,SUI",
+        "BTC,ETH,SOL,ADA,XRP,DOT,AVAX,LINK,OP,RUNE,WLD,JTO,ARB,ATOM,NEAR,APT,SUI,CRO",
     ).split(",")
     if x.strip()
 }
 
-# Persist state between requests (note: /tmp survives runtime, but may reset on redeploy)
 STATE_PATH = "/tmp/investing_agent_state.json"
 
 # ----------------------------
-# eToro endpoints (official)
+# eToro endpoints
 # ----------------------------
 ETORO_REAL_PNL_URL = "https://public-api.etoro.com/api/v1/trading/info/real/pnl"
 ETORO_SEARCH_URL = "https://public-api.etoro.com/api/v1/market-data/search"
+ETORO_CANDLES_URL_TMPL = "https://public-api.etoro.com/api/v1/market-data/instruments/{instrumentId}/history/candles/asc/OneDay/{count}"
 
-# NOTE:
-# Reverse mapping instrumentId -> ticker is not clearly documented as supported via search.
-# So we attempt multiple potential endpoints and keep debug for you.
-ETORO_INSTRUMENTS_BULK_CANDIDATES = [
-    # These are "best guesses" (some environments expose one of these).
-    # If none work, we still function: you’ll see numeric IDs (and techs will be skipped for those).
-    ("GET", "https://public-api.etoro.com/api/v1/market-data/instruments", "instrumentIds"),
-    ("GET", "https://public-api.etoro.com/api/v1/market-data/instruments/details", "instrumentIds"),
-    ("GET", "https://public-api.etoro.com/api/v1/market-data/instruments/info", "instrumentIds"),
-    ("POST", "https://public-api.etoro.com/api/v1/market-data/instruments", "json_body"),
-    ("POST", "https://public-api.etoro.com/api/v1/market-data/instruments/details", "json_body"),
-]
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# ============================================================
+# STATE
+# ============================================================
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_PATH):
@@ -79,6 +70,7 @@ def load_state() -> Dict[str, Any]:
     except Exception:
         return {}
 
+
 def save_state(state: Dict[str, Any]) -> None:
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
@@ -86,11 +78,17 @@ def save_state(state: Dict[str, Any]) -> None:
     except Exception:
         pass
 
+
 def require_admin(request: Request) -> None:
     if ADMIN_TOKEN:
         token = request.headers.get("x-admin-token", "")
         if token != ADMIN_TOKEN:
             raise HTTPException(status_code=401, detail="Missing/invalid x-admin-token")
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
 
 def normalize_number(x: Any) -> Optional[float]:
     if x is None:
@@ -100,6 +98,7 @@ def normalize_number(x: Any) -> Optional[float]:
     except Exception:
         return None
 
+
 def pick_instrument_id(p: Dict[str, Any]) -> Optional[int]:
     iid = p.get("instrumentID") or p.get("instrumentId") or p.get("InstrumentId")
     try:
@@ -107,11 +106,14 @@ def pick_instrument_id(p: Dict[str, Any]) -> Optional[int]:
     except Exception:
         return None
 
+
 def pick_unrealized_pnl(p: Dict[str, Any]) -> Optional[float]:
-    return normalize_number(p.get("unrealizedPnL") or p.get("unrealizedPnl") or p.get("unrealized_pnl") or p.get("pnL") or p.get("pnl"))
+    return normalize_number(p.get("unrealizedPnL") or p.get("unrealizedPnl") or p.get("unrealized_pnl"))
+
 
 def pick_initial_usd(p: Dict[str, Any]) -> Optional[float]:
-    return normalize_number(p.get("initialAmountInDollars") or p.get("initialAmount") or p.get("initial_amount_usd") or p.get("amount"))
+    return normalize_number(p.get("initialAmountInDollars") or p.get("initialAmount") or p.get("initial_amount_usd"))
+
 
 def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
@@ -122,6 +124,7 @@ def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if isinstance(payload.get("positions"), list):
         return payload["positions"]
     return []
+
 
 def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     buckets = defaultdict(list)
@@ -146,9 +149,27 @@ def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tu
     stats = {"lots_count": len(raw_positions), "unique_instruments_count": len(aggregated)}
     return aggregated, stats
 
-# ----------------------------
-# eToro HTTP
-# ----------------------------
+
+def is_crypto_ticker(ticker: str) -> bool:
+    t = (ticker or "").upper().strip()
+    if not t:
+        return False
+    if t in CRYPTO_DENY:
+        return True
+    # common crypto pair shapes
+    if t.endswith("-USD") or t.endswith("USD") or t.endswith("USDT"):
+        return True
+    return False
+
+
+def looks_like_numeric_id(s: str) -> bool:
+    return (s or "").strip().isdigit()
+
+
+# ============================================================
+# eTORO HTTP
+# ============================================================
+
 def etoro_headers() -> Dict[str, str]:
     if not ETORO_API_KEY or not ETORO_USER_KEY:
         return {}
@@ -159,6 +180,7 @@ def etoro_headers() -> Dict[str, str]:
         "user-agent": "fastapi-investing-agent/1.0",
         "accept": "application/json",
     }
+
 
 async def etoro_get_real_pnl() -> Dict[str, Any]:
     if not ETORO_API_KEY or not ETORO_USER_KEY:
@@ -174,6 +196,7 @@ async def etoro_get_real_pnl() -> Dict[str, Any]:
             raise HTTPException(status_code=r.status_code, detail=payload)
         return r.json()
 
+
 async def etoro_search(params: Dict[str, str]) -> Tuple[int, Any]:
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(ETORO_SEARCH_URL, headers=etoro_headers(), params=params)
@@ -183,44 +206,23 @@ async def etoro_search(params: Dict[str, str]) -> Tuple[int, Any]:
             data = {"text": r.text}
         return r.status_code, data
 
+
 def _extract_ticker_from_search_item(item: Dict[str, Any]) -> str:
-    # Some APIs use these keys; we try a handful.
-    for k in ("internalSymbolFull", "symbolFull", "symbol", "ticker", "displaySymbol", "instrumentSymbol"):
+    for k in ("internalSymbolFull", "symbolFull", "symbol", "ticker", "displaySymbol"):
         v = item.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return ""
 
-def is_crypto_ticker(ticker: str) -> bool:
-    t = (ticker or "").upper().strip()
-    if not t:
-        return False
-    if t in CRYPTO_DENY:
-        return True
-    # common crypto pair shapes
-    if t.endswith("-USD") or t.endswith("USD") or t.endswith("USDT"):
-        return True
-    return False
 
-def looks_like_numeric_id(ticker: str) -> bool:
-    t = (ticker or "").strip()
-    return t.isdigit()
-
-# ----------------------------
-# Reverse mapping: instrumentId -> ticker (robust attempts)
-# ----------------------------
-async def map_instrument_ids_to_tickers(instrument_ids: List[int], state: Dict[str, Any]) -> Tuple[Dict[int, str], Dict[str, Any]]:
+async def map_instrument_ids_to_tickers_search(instrument_ids: List[int], state: Dict[str, Any]) -> Tuple[Dict[int, str], Dict[str, Any]]:
     """
-    Returns mapping for ids (including existing cache), and debug.
-    Strategy:
-      1) Load cached mapping from state
-      2) Try "bulk instrument details" endpoints (best-case)
-      3) Try /market-data/search using multiple param patterns (may or may not work)
-      4) Leave unmapped as numeric string (so UI still renders)
+    Tries to map instrumentId -> ticker using /market-data/search.
+    Uses cache stored in state['ticker_cache'].
     """
     ids = sorted(set(int(x) for x in instrument_ids if x is not None))
 
-    # cache in state
+    # load cache
     cache_raw = state.get("ticker_cache") or {}
     cache: Dict[int, str] = {}
     for k, v in cache_raw.items():
@@ -231,151 +233,99 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int], state: Dict[s
 
     missing = [iid for iid in ids if iid not in cache or not cache[iid] or looks_like_numeric_id(cache[iid])]
 
-    dbg: Dict[str, Any] = {
-        "requested": len(ids),
-        "cached_before": len(cache),
-        "missing_before": len(missing),
-        "bulk_attempts": [],
-        "search_attempts": [],
-        "mapped_new": 0,
-        "still_missing": 0,
-    }
+    debug = {"requested": len(ids), "mapped": 0, "failed": 0, "samples": []}
 
-    # ----------------------------
-    # (A) Try bulk instrument info endpoints (best if one exists in your environment)
-    # ----------------------------
-    if missing:
-        chunk_size = 50
-        for method, url, mode in ETORO_INSTRUMENTS_BULK_CANDIDATES:
-            try:
-                newly: Dict[int, str] = {}
-                for i in range(0, len(missing), chunk_size):
-                    chunk = missing[i:i+chunk_size]
-                    async with httpx.AsyncClient(timeout=25) as client:
-                        if method == "GET":
-                            params = {mode: ",".join(str(x) for x in chunk)}
-                            r = await client.get(url, headers=etoro_headers(), params=params)
-                        else:
-                            # POST JSON body variants
-                            body = {"instrumentIds": chunk}
-                            r = await client.post(url, headers=etoro_headers(), json=body)
-                        status = r.status_code
-                        text_preview = (r.text or "")[:300]
-                        data = None
-                        try:
-                            data = r.json()
-                        except Exception:
-                            data = None
+    sem = asyncio.Semaphore(10)
 
-                    extracted = 0
-                    if status < 400 and isinstance(data, (dict, list)):
-                        # Try to find list of instruments in plausible keys
-                        items = None
-                        if isinstance(data, dict):
-                            for k in ("instruments", "items", "data", "result", "results"):
-                                if isinstance(data.get(k), list):
-                                    items = data.get(k)
-                                    break
-                        elif isinstance(data, list):
-                            items = data
+    async def one(iid: int):
+        async with sem:
+            # try several param shapes (eToro can be picky)
+            patterns = [
+                {"instrumentId": str(iid), "pageSize": "5", "pageNumber": "1"},
+                {"internalInstrumentId": str(iid), "pageSize": "5", "pageNumber": "1"},
+                {"q": str(iid), "pageSize": "5", "pageNumber": "1"},
+            ]
 
-                        if isinstance(items, list):
-                            for it in items:
-                                if not isinstance(it, dict):
-                                    continue
-                                # Try common id keys
-                                iid = it.get("instrumentId") or it.get("instrumentID") or it.get("id") or it.get("instrument_id")
-                                sym = it.get("symbolFull") or it.get("internalSymbolFull") or it.get("symbol") or it.get("ticker") or it.get("displaySymbol")
-                                if iid is None or not sym:
-                                    continue
-                                try:
-                                    iid_int = int(iid)
-                                except Exception:
-                                    continue
-                                sym_str = str(sym).strip()
-                                if sym_str:
-                                    newly[iid_int] = sym_str
-                                    extracted += 1
+            for params in patterns:
+                status, data = await etoro_search(params)
+                items = data.get("items") if isinstance(data, dict) else None
+                if isinstance(items, list) and items:
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        t = _extract_ticker_from_search_item(it)
+                        if t and not looks_like_numeric_id(t):
+                            cache[iid] = t
+                            debug["mapped"] += 1
+                            if len(debug["samples"]) < 12:
+                                debug["samples"].append({"instrumentID": iid, "ticker": t, "status": status, "params": params})
+                            return
 
-                    dbg["bulk_attempts"].append({
-                        "method": method,
-                        "url": url,
-                        "mode": mode,
-                        "status": status,
-                        "extracted": extracted,
-                        "preview": text_preview if status >= 400 else None,
-                    })
+            debug["failed"] += 1
+            if len(debug["samples"]) < 12:
+                debug["samples"].append({"instrumentID": iid, "status": "no_match"})
 
-                # apply if any extracted
-                if newly:
-                    for k, v in newly.items():
-                        if k in missing and (k not in cache or looks_like_numeric_id(cache.get(k, ""))):
-                            cache[k] = v
-                    dbg["mapped_new"] += len(newly)
+    await asyncio.gather(*(one(i) for i in missing))
 
-                # refresh missing list after each candidate
-                missing = [iid for iid in ids if iid not in cache or not cache[iid] or looks_like_numeric_id(cache[iid])]
-                if not missing:
-                    break
-            except Exception as e:
-                dbg["bulk_attempts"].append({
-                    "method": method,
-                    "url": url,
-                    "mode": mode,
-                    "status": "exception",
-                    "error": repr(e),
-                })
-
-    # ----------------------------
-    # (B) Try search endpoint in different ways (not guaranteed to support reverse lookup)
-    # ----------------------------
-    if missing:
-        sem = asyncio.Semaphore(10)
-
-        async def one(iid: int):
-            async with sem:
-                patterns = [
-                    {"instrumentId": str(iid), "pageSize": "5", "pageNumber": "1"},
-                    {"instrumentID": str(iid), "pageSize": "5", "pageNumber": "1"},
-                    {"internalInstrumentId": str(iid), "pageSize": "5", "pageNumber": "1"},
-                    {"q": str(iid), "pageSize": "5", "pageNumber": "1"},
-                    {"query": str(iid), "pageSize": "5", "pageNumber": "1"},
-                    {"term": str(iid), "pageSize": "5", "pageNumber": "1"},
-                ]
-                for params in patterns:
-                    status, data = await etoro_search(params)
-                    items = data.get("items") if isinstance(data, dict) else None
-                    if isinstance(items, list) and items:
-                        for it in items:
-                            if not isinstance(it, dict):
-                                continue
-                            t = _extract_ticker_from_search_item(it)
-                            if t and not looks_like_numeric_id(t):
-                                cache[iid] = t
-                                dbg["search_attempts"].append({"instrumentID": iid, "status": status, "used_params": params, "hit": True})
-                                return
-                    dbg["search_attempts"].append({"instrumentID": iid, "status": status, "used_params": params, "hit": False})
-
-        await asyncio.gather(*(one(i) for i in missing))
-
-    still_missing = [iid for iid in ids if iid not in cache or not cache[iid] or looks_like_numeric_id(cache[iid])]
-    dbg["still_missing"] = len(still_missing)
-
-    # Save cache back to state
+    # save cache back
     state["ticker_cache"] = {str(k): v for k, v in cache.items()}
-    state["mapping_last_debug"] = dbg
     state["mapping"] = {"cached": len([iid for iid in ids if iid in cache and not looks_like_numeric_id(cache[iid])]), "total": len(ids)}
+    state["mapping_last_debug"] = {"missing": len(missing), "cached_total": len(cache), "total_today": len(ids), "debug": debug}
     save_state(state)
 
-    return cache, dbg
+    return cache, debug
 
-# ----------------------------
-# Candles (stocks only) via Stooq (no keys)
-# ----------------------------
+
+async def etoro_get_daily_candles(instrument_id: int, count: int = 260) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Fallback candles directly from eToro by instrumentId.
+    Returns (candles, debug).
+    """
+    url = ETORO_CANDLES_URL_TMPL.format(instrumentId=instrument_id, count=count)
+    dbg = {"provider": "etoro", "instrumentId": instrument_id, "requested": count, "status": "init", "http": None, "error": None}
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(url, headers=etoro_headers())
+            dbg["http"] = r.status_code
+            if r.status_code >= 400:
+                dbg["status"] = "http_error"
+                dbg["error"] = (r.text or "")[:300]
+                return [], dbg
+            data = r.json()
+    except Exception as e:
+        dbg["status"] = "exception"
+        dbg["error"] = repr(e)
+        return [], dbg
+
+    candles: List[Dict[str, Any]] = []
+    if isinstance(data, dict):
+        # common shape: {"candles":[{"candles":[{...}, ...]}]}
+        if isinstance(data.get("candles"), list) and data["candles"]:
+            g0 = data["candles"][0]
+            if isinstance(g0, dict) and isinstance(g0.get("candles"), list):
+                candles = [c for c in g0["candles"] if isinstance(c, dict)]
+        # fallback shape: {"items":[...]}
+        elif isinstance(data.get("items"), list):
+            candles = [c for c in data["items"] if isinstance(c, dict)]
+
+    if not candles:
+        dbg["status"] = "empty"
+        return [], dbg
+
+    dbg["status"] = "ok"
+    dbg["rows"] = len(candles)
+    return candles, dbg
+
+
+# ============================================================
+# STOCK CANDLES (Stooq primary)
+# ============================================================
+
 async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Stooq CSV daily candles.
-    For US stocks, stooq usually expects "aapl.us" etc.
+    Fetch daily OHLCV candles from Stooq CSV endpoint.
+    For US listings, Stooq usually expects ".us".
     """
     t = (ticker or "").strip()
     dbg: Dict[str, Any] = {"provider": "stooq", "input": ticker, "requested": count, "status": "init", "http": None, "error": None}
@@ -389,24 +339,35 @@ async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[D
         return [], dbg
 
     s = t.lower()
+    # if caller already supplied a suffix, keep it (e.g., BOE.ASX)
     if "." not in s:
         s = f"{s}.us"
 
     url = "https://stooq.com/q/d/l/"
     params = {"s": s, "i": "d"}
 
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(url, params=params, headers={"accept": "text/csv"})
-            dbg["http"] = r.status_code
-            if r.status_code >= 400:
-                dbg["status"] = "http_error"
-                dbg["error"] = (r.text or "")[:300]
-                return [], dbg
-            text = r.text or ""
-    except Exception as e:
+    # retry loop (fixes transient ConnectError on Railway sometimes)
+    last_err = None
+    text = ""
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.get(url, params=params, headers={"accept": "text/csv"})
+                dbg["http"] = r.status_code
+                if r.status_code >= 400:
+                    dbg["status"] = "http_error"
+                    dbg["error"] = (r.text or "")[:300]
+                    return [], dbg
+                text = r.text or ""
+                last_err = None
+                break
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(0.6 * attempt)
+
+    if last_err is not None:
         dbg["status"] = "exception"
-        dbg["error"] = repr(e)
+        dbg["error"] = repr(last_err)
         return [], dbg
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -442,13 +403,16 @@ async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[D
     dbg["rows"] = len(candles)
     return candles, dbg
 
-# ----------------------------
-# Technicals (simple, stable)
-# ----------------------------
+
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
+
 def sma(values: List[float], n: int) -> Optional[float]:
     if len(values) < n:
         return None
     return sum(values[-n:]) / n
+
 
 def ema_series(values: List[float], n: int) -> List[float]:
     if not values:
@@ -461,6 +425,7 @@ def ema_series(values: List[float], n: int) -> List[float]:
         e = v * k + e * (1 - k)
         out.append(e)
     return out
+
 
 def rsi(closes: List[float], n: int = 14) -> Optional[float]:
     if len(closes) <= n:
@@ -477,6 +442,7 @@ def rsi(closes: List[float], n: int = 14) -> Optional[float]:
     rs = (gains / n) / (losses / n)
     return 100 - (100 / (1 + rs))
 
+
 def macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     if len(closes) < slow + signal:
         return None, None, None
@@ -485,6 +451,7 @@ def macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -
     macd_line = [f - s for f, s in zip(fast_, slow_)]
     sig = ema_series(macd_line, signal)
     return macd_line[-1], sig[-1], (macd_line[-1] - sig[-1])
+
 
 def tech_tags(t: Dict[str, Any]) -> str:
     tags = []
@@ -511,6 +478,11 @@ def tech_tags(t: Dict[str, Any]) -> str:
 
     return " | ".join(tags)
 
+
+# ============================================================
+# TECH PIPELINE
+# ============================================================
+
 async def compute_technicals_for_ids(
     instrument_ids: List[int],
     ticker_map: Dict[int, str],
@@ -518,14 +490,15 @@ async def compute_technicals_for_ids(
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
     """
     Stocks-only technicals:
-      - if ticker is missing/unknown/numeric => skip
-      - if ticker looks crypto and EXCLUDE_CRYPTO => skip
-      - else candles via Stooq => compute SMA/RSI/MACD + liquidity flag
+      - skip missing tickers / numeric ids
+      - skip crypto (EXCLUDE_CRYPTO)
+      - primary candles: Stooq
+      - fallback candles: eToro (by instrumentId) if Stooq fails/no data/connection error
     """
     ids = sorted(set(int(x) for x in instrument_ids if x is not None))
     tech_map: Dict[int, Dict[str, Any]] = {}
     debug: Dict[str, Any] = {
-        "provider": "stooq",
+        "provider": "stooq+etoro_fallback",
         "requested": len(ids),
         "computed": 0,
         "skipped": 0,
@@ -541,22 +514,30 @@ async def compute_technicals_for_ids(
 
             if not ticker or looks_like_numeric_id(ticker):
                 debug["skipped"] += 1
-                if len(debug["samples"]) < 12:
+                if len(debug["samples"]) < 15:
                     debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "skipped_no_ticker"})
                 return
 
             if EXCLUDE_CRYPTO and is_crypto_ticker(ticker):
                 debug["skipped"] += 1
-                if len(debug["samples"]) < 12:
+                if len(debug["samples"]) < 15:
                     debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "skipped_crypto"})
                 return
 
+            # 1) Stooq
             candles, cdbg = await stooq_get_daily_candles(ticker, count=candles_count)
-            if not candles or len(candles) < 80:
-                debug["failed"] += 1
-                if len(debug["samples"]) < 12:
-                    debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "no_candles", "cdbg": cdbg})
-                return
+
+            # 2) Fallback to eToro candles if Stooq fails
+            if (not candles) or (len(candles) < 80):
+                ecandles, edbg = await etoro_get_daily_candles(iid, count=candles_count)
+                if ecandles and len(ecandles) >= 80:
+                    candles = ecandles
+                    cdbg = {"stooq": cdbg, "fallback": edbg}
+                else:
+                    debug["failed"] += 1
+                    if len(debug["samples"]) < 15:
+                        debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "no_candles", "cdbg": cdbg, "fallback": edbg})
+                    return
 
             closes = [normalize_number(c.get("close")) for c in candles]
             vols = [normalize_number(c.get("volume")) for c in candles]
@@ -565,7 +546,7 @@ async def compute_technicals_for_ids(
 
             if len(closes) < 80:
                 debug["failed"] += 1
-                if len(debug["samples"]) < 12:
+                if len(debug["samples"]) < 15:
                     debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "not_enough_closes"})
                 return
 
@@ -605,7 +586,7 @@ async def compute_technicals_for_ids(
                 "adv20": adv20,
                 "dollar_adv20": dollar_adv20,
                 "illiquid": illiquid,
-                "candles_provider": "stooq",
+                "candles_debug": cdbg,  # keep debug so you can inspect source used
             }
 
             debug["computed"] += 1
@@ -615,14 +596,15 @@ async def compute_technicals_for_ids(
     await asyncio.gather(*(one(i) for i in ids))
     return tech_map, debug
 
-# ----------------------------
-# Portfolio rows
-# ----------------------------
+
+# ============================================================
+# PRESENTATION LAYER
+# ============================================================
+
 def build_portfolio_rows(
     agg: List[Dict[str, Any]],
     ticker_map: Dict[int, str],
     tech_map: Dict[int, Dict[str, Any]],
-    exclude_crypto: bool,
 ) -> List[Dict[str, Any]]:
     total_initial = sum(float(x.get("initialAmountInDollars") or 0) for x in agg) or 0.0
     rows: List[Dict[str, Any]] = []
@@ -631,7 +613,8 @@ def build_portfolio_rows(
         iid = int(a["instrumentID"])
         ticker = (ticker_map.get(iid) or str(iid)).strip()
 
-        if exclude_crypto and is_crypto_ticker(ticker):
+        # Stocks-only view
+        if EXCLUDE_CRYPTO and is_crypto_ticker(ticker):
             continue
 
         initial = normalize_number(a.get("initialAmountInDollars"))
@@ -654,6 +637,7 @@ def build_portfolio_rows(
 
     return rows
 
+
 def deterministic_brief(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "No portfolio rows."
@@ -672,8 +656,8 @@ def deterministic_brief(rows: List[Dict[str, Any]]) -> str:
     overbought = sorted(rsis_clean, key=lambda x: x[1], reverse=True)[:5]
     oversold = sorted(rsis_clean, key=lambda x: x[1])[:5]
 
-    below200 = [r["ticker"] for r in rows if r.get("tech", {}).get("above_sma200") is False][:10]
-    illq = [r["ticker"] for r in rows if r.get("tech", {}).get("illiquid")][:10]
+    below200 = [r["ticker"] for r in rows if r.get("tech", {}).get("above_sma200") is False][:12]
+    illq = [r["ticker"] for r in rows if r.get("tech", {}).get("illiquid")][:12]
 
     lines = []
     lines.append("DAILY BRIEF (read-only)")
@@ -694,9 +678,11 @@ def deterministic_brief(rows: List[Dict[str, Any]]) -> str:
     lines.append("Notes: No buy/sell instructions. Use as a checklist for research.")
     return "\n".join(lines)
 
-# ----------------------------
-# Discord (optional)
-# ----------------------------
+
+# ============================================================
+# DISCORD (optional)
+# ============================================================
+
 async def discord_notify(text: str) -> None:
     if not DISCORD_WEBHOOK_URL:
         return
@@ -705,6 +691,7 @@ async def discord_notify(text: str) -> None:
             await client.post(DISCORD_WEBHOOK_URL, json={"content": text})
     except Exception:
         pass
+
 
 # ============================================================
 # ROUTES
@@ -730,7 +717,7 @@ async def dashboard():
         return f"<ul>{lis}</ul>"
 
     rows_html = ""
-    for r in portfolio[:200]:
+    for r in portfolio[:250]:
         rows_html += (
             "<tr>"
             f"<td>{r.get('ticker','')}</td>"
@@ -802,13 +789,13 @@ async def dashboard():
     """
     return HTMLResponse(html)
 
+
 @app.get("/tasks/daily")
 async def run_daily():
     state = load_state()
 
     material_events: List[str] = []
     technical_exceptions: List[str] = []
-    action_required: List[str] = []
 
     material_events.append(
         f"System check: OpenAI={'True' if bool(OPENAI_API_KEY) else 'False'}, "
@@ -826,33 +813,33 @@ async def run_daily():
 
     instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
 
-    # 1) Map instrument IDs -> tickers (robust)
-    ticker_cache, map_dbg = await map_instrument_ids_to_tickers(instrument_ids, state)
+    # 1) Mapping
+    ticker_cache, map_dbg = await map_instrument_ids_to_tickers_search(instrument_ids, state)
+    mapping = state.get("mapping") or {"cached": 0, "total": len(instrument_ids)}
+    material_events.append(f"Resolved tickers: {mapping.get('cached',0)}/{mapping.get('total',len(instrument_ids))} (see /debug/mapping-last)")
 
-    mapped_count = state.get("mapping", {}).get("cached", 0)
-    material_events.append(f"Resolved tickers: {mapped_count}/{len(instrument_ids)} (see /debug/mapping-last)")
-
-    # 2) Technicals (stocks only)
+    # 2) Tech
     tech_map, tech_dbg = await compute_technicals_for_ids(instrument_ids, ticker_cache)
     state["tech_debug"] = tech_dbg
 
     if tech_dbg.get("failed", 0) > 0:
         technical_exceptions.append(f"Candles missing for {tech_dbg.get('failed')} instruments (see /debug/tech-last).")
+
     if tech_dbg.get("skipped", 0) > 0:
         material_events.append(f"Skipped {tech_dbg.get('skipped')} instruments (no ticker / crypto excluded).")
 
-    # 3) Build portfolio rows (apply crypto exclusion here too)
-    portfolio_rows = build_portfolio_rows(agg_positions, ticker_cache, tech_map, exclude_crypto=EXCLUDE_CRYPTO)
+    # 3) Portfolio table rows
+    portfolio_rows = build_portfolio_rows(agg_positions, ticker_cache, tech_map)
 
     # 4) Brief
     brief = deterministic_brief(portfolio_rows)
 
-    # 5) Discord (optional)
+    # 5) Discord notify (optional)
     tech_done = tech_dbg.get("computed", 0)
     tech_req = tech_dbg.get("requested", len(instrument_ids))
     tech_skip = tech_dbg.get("skipped", 0)
     tech_den = max(0, int(tech_req) - int(tech_skip))
-    await discord_notify(f"✅ Daily done | tickers {mapped_count}/{len(instrument_ids)} | tech {tech_done}/{tech_den}")
+    await discord_notify(f"✅ Daily done | tickers {mapping.get('cached',0)}/{len(instrument_ids)} | tech {tech_done}/{tech_den}")
 
     # Save state for dashboard/API
     state.update({
@@ -863,6 +850,7 @@ async def run_daily():
         "positions": portfolio_rows,
         "stats": stats,
         "brief": brief,
+        "mapping": mapping,
     })
     save_state(state)
 
@@ -870,11 +858,12 @@ async def run_daily():
         "status": "ok",
         "lots": stats["lots_count"],
         "unique_instruments": stats["unique_instruments_count"],
-        "mapped_symbols": mapped_count,
+        "mapped_symbols": mapping.get("cached", 0),
         "technicals_computed": tech_done,
         "technicals_requested": tech_den,
         "technicals_skipped": tech_skip,
     }
+
 
 @app.get("/api/portfolio")
 async def api_portfolio():
@@ -886,6 +875,7 @@ async def api_portfolio():
         "tech_debug": state.get("tech_debug") or {},
         "positions": state.get("positions") or [],
     })
+
 
 @app.get("/api/daily-brief")
 async def api_daily_brief():
@@ -901,55 +891,66 @@ async def api_daily_brief():
         "tech_debug": state.get("tech_debug") or {},
     })
 
+
 @app.get("/debug/mapping-last")
 async def debug_mapping_last():
     state = load_state()
     return JSONResponse(state.get("mapping_last_debug") or {"note": "Run /tasks/daily first."})
+
 
 @app.get("/debug/tech-last")
 async def debug_tech_last():
     state = load_state()
     return JSONResponse(state.get("tech_debug") or {"note": "Run /tasks/daily first."})
 
+
 @app.get("/debug/candles")
-async def debug_candles(ticker: str = Query(..., description="Try: CCJ, ASML, CEG, ALB")):
+async def debug_candles(
+    ticker: str = Query(..., description="Try: CCJ, ASML, CEG, ALB, STEM, RKLB"),
+):
     if EXCLUDE_CRYPTO and is_crypto_ticker(ticker):
         return JSONResponse({"ticker": ticker, "status": "skipped_crypto"})
+
     candles, dbg = await stooq_get_daily_candles(ticker, count=180)
     sample = candles[-3:] if candles else []
     return JSONResponse({"ticker": ticker, "debug": dbg, "rows": len(candles), "sample": sample})
 
+
+@app.get("/debug/etoro-candles")
+async def debug_etoro_candles(
+    instrument_id: int = Query(..., description="numeric instrumentID from your table"),
+):
+    candles, dbg = await etoro_get_daily_candles(instrument_id, count=260)
+    sample = candles[-3:] if candles else []
+    return JSONResponse({"instrumentId": instrument_id, "debug": dbg, "rows": len(candles), "sample": sample})
+
+
 @app.get("/debug/search-test")
-async def debug_search_test(instrument_id: int = Query(..., description="Paste a numeric instrumentID from your table (e.g. 9031)")):
-    # This tells us if /market-data/search can reverse-map instrument IDs in your environment.
+async def debug_search_test(
+    instrument_id: int = Query(..., description="numeric instrumentID from your table"),
+):
     patterns = [
         {"instrumentId": str(instrument_id), "pageSize": "5", "pageNumber": "1"},
-        {"instrumentID": str(instrument_id), "pageSize": "5", "pageNumber": "1"},
         {"internalInstrumentId": str(instrument_id), "pageSize": "5", "pageNumber": "1"},
         {"q": str(instrument_id), "pageSize": "5", "pageNumber": "1"},
-        {"query": str(instrument_id), "pageSize": "5", "pageNumber": "1"},
-        {"term": str(instrument_id), "pageSize": "5", "pageNumber": "1"},
     ]
     results = []
     for params in patterns:
         status, data = await etoro_search(params)
-        results.append({
-            "params": params,
-            "status": status,
-            "preview": str(data)[:600],
-        })
+        results.append({"params": params, "status": status, "preview": str(data)[:800]})
     return JSONResponse({
         "instrumentId": instrument_id,
         "keys_present": {"ETORO_API_KEY": bool(ETORO_API_KEY), "ETORO_USER_KEY": bool(ETORO_USER_KEY)},
         "results": results,
     })
 
+
 @app.post("/admin/seed-mapping")
 async def admin_seed_mapping(request: Request):
     """
-    If eToro doesn't expose reverse mapping in your environment, this endpoint lets you seed it once.
-    POST JSON like: {"9031":"CCJ","9979":"ASML", ...}
-    (Needs x-admin-token header if you set ADMIN_TOKEN)
+    If some instrumentIDs never map via /search, seed them once.
+    POST JSON like: {"9031":"STEM","9085":"RKLB"}
+    Add header x-admin-token if ADMIN_TOKEN is set.
     """
     require_admin(request)
     body = await request.json()
@@ -958,6 +959,8 @@ async def admin_seed_mapping(request: Request):
 
     state = load_state()
     cache_raw = state.get("ticker_cache") or {}
+
+    seeded = 0
     for k, v in body.items():
         try:
             iid = int(k)
@@ -966,7 +969,8 @@ async def admin_seed_mapping(request: Request):
         sym = str(v).strip()
         if sym:
             cache_raw[str(iid)] = sym
+            seeded += 1
 
     state["ticker_cache"] = cache_raw
     save_state(state)
-    return {"status": "ok", "seeded": len(body), "note": "Run /tasks/daily again."}
+    return {"status": "ok", "seeded": seeded, "note": "Run /tasks/daily again."}
