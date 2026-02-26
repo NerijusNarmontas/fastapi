@@ -19,9 +19,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()   # eToro x-api-key
 ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip() # eToro x-user-key
 
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()       # optional (keep empty if you don't want auth yet)
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()       # optional
 
-# Files (Railway containers can restart; /tmp is fine for lightweight cache)
 STATE_PATH = "/tmp/investing_agent_state.json"
 
 ETORO_REAL_PNL_URL = "https://public-api.etoro.com/api/v1/trading/info/real/pnl"
@@ -94,17 +93,6 @@ def chunk_list(items: List[int], size: int = 100) -> List[List[int]]:
 
 
 def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    eToro API commonly returns:
-    {
-      "clientPortfolio": {
-        "positions": [ ...lots... ]
-      }
-    }
-    We'll try multiple fallbacks.
-    """
-    if not isinstance(payload, dict):
-        return []
     cp = payload.get("clientPortfolio") or payload.get("ClientPortfolio") or {}
     if isinstance(cp, dict) and isinstance(cp.get("positions"), list):
         return cp["positions"]
@@ -114,10 +102,6 @@ def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """
-    eToro returns LOTS (many rows per same instrument). You want UNIQUE instruments (~65).
-    This groups lots by instrumentID and sums notional and PnL.
-    """
     buckets = defaultdict(list)
     for p in raw_positions:
         iid = pick_instrument_id(p)
@@ -139,10 +123,7 @@ def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tu
 
     aggregated.sort(key=lambda x: x.get("initialAmountInDollars", 0) or 0, reverse=True)
 
-    stats = {
-        "lots_count": len(raw_positions),
-        "unique_instruments_count": len(aggregated),
-    }
+    stats = {"lots_count": len(raw_positions), "unique_instruments_count": len(aggregated)}
     return aggregated, stats
 
 
@@ -156,14 +137,13 @@ def etoro_headers() -> Dict[str, str]:
         "x-api-key": ETORO_API_KEY,
         "x-user-key": ETORO_USER_KEY,
         "x-request-id": str(uuid.uuid4()),
+        # Adding a UA sometimes helps with edge/CDN behavior:
+        "user-agent": "fastapi-investing-agent/1.0",
+        "accept": "application/json",
     }
 
 
 async def etoro_get_real_pnl() -> Dict[str, Any]:
-    """
-    GET https://public-api.etoro.com/api/v1/trading/info/real/pnl
-    Required headers: x-api-key, x-user-key, x-request-id
-    """
     if not ETORO_API_KEY or not ETORO_USER_KEY:
         raise HTTPException(status_code=400, detail="Missing ETORO_API_KEY or ETORO_USER_KEY")
 
@@ -174,90 +154,135 @@ async def etoro_get_real_pnl() -> Dict[str, Any]:
                 payload = r.json()
             except Exception:
                 payload = {"text": r.text}
-            raise HTTPException(
-                status_code=r.status_code,
-                detail={"etoro_error": True, "status": r.status_code, "payload": payload},
-            )
+            raise HTTPException(status_code=r.status_code, detail=payload)
         return r.json()
 
 
-async def etoro_get_instruments_metadata(instrument_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+def _parse_instrument_meta_response(data: Any) -> Dict[int, Dict[str, Any]]:
     """
-    GET https://public-api.etoro.com/api/v1/market-data/instruments?instrumentIds=1,2,3
-
-    Returns mapping:
-      instrumentId -> { symbolFull, instrumentDisplayName, exchangeId, instrumentTypeId, ... }
-
-    We store symbolFull as the ticker to display (e.g., EQT, CCJ, ...).
+    Expected:
+      {"instrumentDisplayDatas":[{"instrumentId":..., "symbolFull":...}, ...]}
     """
+    out: Dict[int, Dict[str, Any]] = {}
+    if not isinstance(data, dict):
+        return out
+    items = data.get("instrumentDisplayDatas") or []
+    if not isinstance(items, list):
+        return out
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            iid = int(it.get("instrumentId") or it.get("instrumentID"))
+        except Exception:
+            continue
+        out[iid] = it
+    return out
+
+
+async def etoro_get_instruments_metadata(instrument_ids: List[int]) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
+    """
+    FIX: eToro may require repeated params:
+      ?instrumentIds=9031&instrumentIds=9979
+    We'll try:
+      1) comma-separated
+      2) if empty -> retry with repeated params
+    Returns (mapping, debug_info)
+    """
+    debug: Dict[str, Any] = {
+        "attempts": [],
+        "total_requested": len(instrument_ids),
+    }
+
     if not instrument_ids:
-        return {}
+        return {}, debug
 
     if not ETORO_API_KEY or not ETORO_USER_KEY:
         raise HTTPException(status_code=400, detail="Missing ETORO_API_KEY or ETORO_USER_KEY")
 
-    out: Dict[int, Dict[str, Any]] = {}
-
     batches = chunk_list(sorted(set(int(x) for x in instrument_ids)), size=100)
+    result: Dict[int, Dict[str, Any]] = {}
+
     async with httpx.AsyncClient(timeout=30) as client:
         for batch in batches:
-            params = {"instrumentIds": ",".join(str(i) for i in batch)}
-            r = await client.get(ETORO_INSTRUMENTS_META_URL, headers=etoro_headers(), params=params)
-            if r.status_code >= 400:
-                # Do not break whole run if one batch fails; just skip it
-                continue
-            data = r.json() if isinstance(r.json(), dict) else {}
-            items = data.get("instrumentDisplayDatas") or data.get("instrumentDisplayData") or []
-            if not isinstance(items, list):
+            # Attempt 1: comma-separated
+            params1 = {"instrumentIds": ",".join(str(i) for i in batch)}
+            r1 = await client.get(ETORO_INSTRUMENTS_META_URL, headers=etoro_headers(), params=params1)
+            data1 = None
+            parsed1: Dict[int, Dict[str, Any]] = {}
+            err1 = None
+            try:
+                data1 = r1.json()
+                parsed1 = _parse_instrument_meta_response(data1)
+            except Exception as e:
+                err1 = str(e)
+
+            debug["attempts"].append({
+                "format": "comma",
+                "status": r1.status_code,
+                "requested_count": len(batch),
+                "returned_count": len(parsed1),
+                "error": err1,
+                "sample_response_keys": list(data1.keys())[:10] if isinstance(data1, dict) else type(data1).__name__,
+            })
+
+            if r1.status_code == 200 and len(parsed1) > 0:
+                result.update(parsed1)
                 continue
 
-            for it in items:
-                try:
-                    iid = int(it.get("instrumentId") or it.get("instrumentID"))
-                except Exception:
-                    continue
-                out[iid] = it
+            # Attempt 2: repeated params (most compatible)
+            params2 = [("instrumentIds", str(i)) for i in batch]
+            r2 = await client.get(ETORO_INSTRUMENTS_META_URL, headers=etoro_headers(), params=params2)
+            data2 = None
+            parsed2: Dict[int, Dict[str, Any]] = {}
+            err2 = None
+            try:
+                data2 = r2.json()
+                parsed2 = _parse_instrument_meta_response(data2)
+            except Exception as e:
+                err2 = str(e)
 
-    return out
+            debug["attempts"].append({
+                "format": "repeated",
+                "status": r2.status_code,
+                "requested_count": len(batch),
+                "returned_count": len(parsed2),
+                "error": err2,
+                "sample_response_keys": list(data2.keys())[:10] if isinstance(data2, dict) else type(data2).__name__,
+                "sample_first_item": (data2.get("instrumentDisplayDatas", [{}])[0] if isinstance(data2, dict) else None),
+            })
+
+            if r2.status_code == 200 and len(parsed2) > 0:
+                result.update(parsed2)
+
+    debug["total_mapped"] = len(result)
+    return result, debug
 
 
 def build_portfolio_rows_from_aggregates(
     agg: List[Dict[str, Any]],
     instrument_map: Dict[int, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    Build rows for dashboard + /api/portfolio from aggregated positions.
-    ticker = symbolFull if available else instrumentID
-    """
     total_initial = sum(float(x.get("initialAmountInDollars") or 0) for x in agg) or 0.0
 
     rows: List[Dict[str, Any]] = []
     for a in agg:
-        instrument_id = a.get("instrumentID")
-        iid = int(instrument_id) if instrument_id is not None else None
-
-        meta = instrument_map.get(iid, {}) if iid is not None else {}
-        symbol = (meta.get("symbolFull") or meta.get("SymbolFull") or "").strip()
-        display_name = (meta.get("instrumentDisplayName") or meta.get("displayName") or "").strip()
+        iid = int(a["instrumentID"])
+        meta = instrument_map.get(iid, {}) or {}
+        symbol = (meta.get("symbolFull") or "").strip()
 
         initial = normalize_number(a.get("initialAmountInDollars"))
         unreal = normalize_number(a.get("unrealizedPnL"))
 
-        weight_pct = None
-        if total_initial > 0 and initial is not None and initial > 0:
-            weight_pct = (initial / total_initial) * 100.0
-
-        pnl_pct = None
-        if unreal is not None and initial is not None and initial != 0:
-            pnl_pct = (unreal / initial) * 100.0
+        weight_pct = (initial / total_initial * 100.0) if (total_initial > 0 and initial and initial > 0) else None
+        pnl_pct = (unreal / initial * 100.0) if (initial and initial != 0 and unreal is not None) else None
 
         rows.append({
-            "ticker": symbol if symbol else (str(iid) if iid is not None else "NA"),
-            "name": display_name,
-            "instrumentID": str(iid) if iid is not None else "",
+            "ticker": symbol if symbol else str(iid),
+            "instrumentID": str(iid),
             "lots": str(a.get("lots", "")),
-            "weight_pct": (f"{weight_pct:.2f}" if weight_pct is not None else ""),
-            "pnl_pct": (f"{pnl_pct:.2f}" if pnl_pct is not None else ""),
+            "weight_pct": f"{weight_pct:.2f}" if weight_pct is not None else "",
+            "pnl_pct": f"{pnl_pct:.2f}" if pnl_pct is not None else "",
             "thesis_score": "",
             "tech_status": "",
         })
@@ -273,30 +298,18 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
         return "OpenAI key not set. (Skipping AI brief.)"
 
     top = portfolio_rows[:25]
-    lines = []
-    for r in top:
-        lines.append(f"{r['ticker']}: weight={r['weight_pct']}% pnl={r['pnl_pct']}%")
+    lines = [f"{r['ticker']}: weight={r['weight_pct']}% pnl={r['pnl_pct']}%" for r in top]
     portfolio_text = "\n".join(lines) if lines else "(no positions)"
 
     prompt = (
         "You are an investing assistant. READ-ONLY.\n"
-        "Given today's portfolio snapshot (tickers, weights, pnl%), write a short daily brief:\n"
-        "- 5 bullet material events to check today (macro/sector angles)\n"
-        "- 5 bullet risk items\n"
-        "- 5 bullet watchlist items\n"
-        "Do NOT give buy/sell instructions. Do NOT give price predictions.\n\n"
+        "Do NOT give buy/sell instructions. Do NOT predict prices.\n"
+        "Write a short daily brief: material events, risks, watchlist.\n\n"
         f"Portfolio:\n{portfolio_text}\n"
     )
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": "gpt-5-mini",
-        "input": prompt,
-        "max_output_tokens": 500,
-    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    body = {"model": "gpt-5-mini", "input": prompt, "max_output_tokens": 500}
 
     async with httpx.AsyncClient(timeout=45) as client:
         r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=body)
@@ -306,24 +319,8 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
             except Exception:
                 err = {"text": r.text}
             return f"OpenAI error {r.status_code}: {err}"
-
         data = r.json()
-        output_text = None
-        if isinstance(data, dict):
-            output_text = data.get("output_text")
-
-            if not output_text and isinstance(data.get("output"), list):
-                chunks = []
-                for item in data["output"]:
-                    if not isinstance(item, dict):
-                        continue
-                    for c in item.get("content", []) or []:
-                        if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
-                            chunks.append(c.get("text", ""))
-                if chunks:
-                    output_text = "\n".join([x for x in chunks if x])
-
-        return output_text or "AI brief generated (but could not parse output_text)."
+        return data.get("output_text") or "AI brief generated (output_text missing)."
 
 
 # ----------------------------
@@ -336,32 +333,29 @@ async def dashboard():
     last_update = state.get("date") or utc_now_iso()
     material_events = state.get("material_events") or []
     technical_exceptions = state.get("technical_exceptions") or []
-    action_required = state.get("action_required") or ["Run /tasks/daily once to generate today's brief."]
+    action_required = state.get("action_required") or ["Run /tasks/daily once to refresh data."]
 
     portfolio = state.get("positions") or []
     stats = state.get("stats") or {}
     ai_brief = state.get("ai_brief") or ""
 
     def bullets(items: List[str]) -> str:
-        if not items:
-            return "<ul><li>None</li></ul>"
-        lis = "".join([f"<li>{x}</li>" for x in items])
+        lis = "".join([f"<li>{x}</li>" for x in items]) if items else "<li>None</li>"
         return f"<ul>{lis}</ul>"
 
     rows_html = ""
-    if portfolio:
-        for r in portfolio[:200]:
-            rows_html += (
-                "<tr>"
-                f"<td>{r.get('ticker','')}</td>"
-                f"<td>{r.get('lots','')}</td>"
-                f"<td>{r.get('weight_pct','')}</td>"
-                f"<td>{r.get('pnl_pct','')}</td>"
-                f"<td>{r.get('thesis_score','')}</td>"
-                f"<td>{r.get('tech_status','')}</td>"
-                "</tr>"
-            )
-    else:
+    for r in portfolio[:200]:
+        rows_html += (
+            "<tr>"
+            f"<td>{r.get('ticker','')}</td>"
+            f"<td>{r.get('lots','')}</td>"
+            f"<td>{r.get('weight_pct','')}</td>"
+            f"<td>{r.get('pnl_pct','')}</td>"
+            f"<td>{r.get('thesis_score','')}</td>"
+            f"<td>{r.get('tech_status','')}</td>"
+            "</tr>"
+        )
+    if not rows_html:
         rows_html = "<tr><td colspan='6'>No positions saved yet.</td></tr>"
 
     lots_count = stats.get("lots_count", "")
@@ -400,7 +394,7 @@ async def dashboard():
         <pre style="white-space: pre-wrap; background:#fafafa; border:1px solid #eee; padding:12px;">{ai_brief or "No brief yet. Run /tasks/daily."}</pre>
 
         <h2>Portfolio (unique instruments)</h2>
-        <p><i>Now showing mapped tickers when available (fallback to instrumentID if eToro metadata is missing).</i></p>
+        <p><i>If mapping works, tickers will be symbols (EQT, CCJ...). If not, you’ll still see instrumentID numbers.</i></p>
 
         <table>
           <thead>
@@ -418,7 +412,7 @@ async def dashboard():
           </tbody>
         </table>
 
-        <p>API: <code>/api/daily-brief</code> • <code>/api/portfolio</code> • Debug: <code>/debug/instrument-map</code></p>
+        <p>API: <code>/api/portfolio</code> • <code>/api/daily-brief</code> • Debug: <code>/debug/meta-last</code></p>
       </body>
     </html>
     """
@@ -438,10 +432,6 @@ async def run_daily():
         f"eToro keys loaded={'True' if (bool(ETORO_API_KEY) and bool(ETORO_USER_KEY)) else 'False'}."
     )
 
-    raw_positions: List[Dict[str, Any]] = []
-    agg_positions: List[Dict[str, Any]] = []
-    stats: Dict[str, int] = {"lots_count": 0, "unique_instruments_count": 0}
-
     # Fetch eToro portfolio
     try:
         payload = await etoro_get_real_pnl()
@@ -452,78 +442,62 @@ async def run_daily():
             f"Pulled eToro successfully. Lots: {stats['lots_count']} | Unique instruments: {stats['unique_instruments_count']}"
         )
     except HTTPException as e:
-        material_events.append(f"eToro API error: HTTP {e.status_code}")
-        material_events.append(str(e.detail))
-        raw_positions = []
-        agg_positions = []
-        stats = {"lots_count": 0, "unique_instruments_count": 0}
-
-    # Symbol mapping step
-    instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
-    prev_map = state.get("instrument_map") or {}
-    # convert prev_map keys back to int for internal use
-    instrument_map: Dict[int, Dict[str, Any]] = {}
-    try:
-        for k, v in prev_map.items():
-            instrument_map[int(k)] = v
-    except Exception:
-        instrument_map = {}
-
-    try:
-        fetched_meta = await etoro_get_instruments_metadata(instrument_ids)
-        # merge/overwrite cached map
-        instrument_map.update(fetched_meta)
-        material_events.append(f"Instrument metadata fetched: {len(fetched_meta)} mapped.")
-    except Exception as e:
-        material_events.append(f"Instrument metadata fetch failed (will use cache/fallback): {str(e)}")
-
-    # Build rows (unique instruments, with mapped tickers)
-    portfolio_rows = build_portfolio_rows_from_aggregates(agg_positions, instrument_map) if agg_positions else []
-
-    # Mapping stats
-    mapped = 0
-    for r in portfolio_rows:
-        # mapped if ticker is not numeric
-        t = (r.get("ticker") or "").strip()
-        if t and not t.isdigit():
-            mapped += 1
-    technical_exceptions.append(
-        f"Symbol mapping: {mapped}/{len(portfolio_rows)} tickers mapped (rest fallback to instrumentID)."
-    )
-    technical_exceptions.append("Next steps: RSI/MACD/MAs/Volume/ADV per ticker + liquidity flags.")
-
-    # AI Brief
-    if portfolio_rows:
-        ai_brief = await generate_openai_brief(portfolio_rows)
-    else:
-        ai_brief = "No positions found yet (or eToro call failed)."
-
-    if not action_required:
-        action_required.append("None")
-
-    # Save mapping as JSON-safe keys (strings)
-    instrument_map_jsonsafe = {str(k): v for k, v in instrument_map.items()}
-
-    state.update(
-        {
+        state.update({
             "date": utc_now_iso(),
-            "material_events": material_events,
+            "material_events": material_events + [f"eToro API error: {e.status_code}", str(e.detail)],
             "technical_exceptions": technical_exceptions,
-            "action_required": action_required,
-            "positions": portfolio_rows,       # aggregated view for dashboard
-            "stats": stats,                    # lots vs unique counts
-            "ai_brief": ai_brief,
-            "raw_positions_count": len(raw_positions),
-            "instrument_map": instrument_map_jsonsafe,
-        }
-    )
+            "action_required": ["Fix eToro keys or API access."],
+            "positions": [],
+            "stats": {"lots_count": 0, "unique_instruments_count": 0},
+            "ai_brief": "",
+        })
+        save_state(state)
+        return {"status": "error", "detail": e.detail}
+
+    instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
+
+    # Load cached map
+    cached_map_raw = state.get("instrument_map") or {}
+    instrument_map: Dict[int, Dict[str, Any]] = {}
+    for k, v in cached_map_raw.items():
+        try:
+            instrument_map[int(k)] = v
+        except Exception:
+            continue
+
+    # Fetch metadata (fixed)
+    fetched_meta, meta_debug = await etoro_get_instruments_metadata(instrument_ids)
+    instrument_map.update(fetched_meta)
+
+    material_events.append(f"Instrument metadata mapped: {len(fetched_meta)} (total cached now {len(instrument_map)}).")
+
+    # Build rows with symbol mapping
+    portfolio_rows = build_portfolio_rows_from_aggregates(agg_positions, instrument_map)
+
+    mapped = sum(1 for r in portfolio_rows if r.get("ticker") and not str(r["ticker"]).isdigit())
+    technical_exceptions.append(f"Symbol mapping: {mapped}/{len(portfolio_rows)} mapped.")
+    technical_exceptions.append("Next: RSI/MACD/MAs/Volume/ADV + liquidity flags.")
+
+    ai_brief = await generate_openai_brief(portfolio_rows) if portfolio_rows else "No positions."
+
+    # Save JSON-safe
+    state.update({
+        "date": utc_now_iso(),
+        "material_events": material_events,
+        "technical_exceptions": technical_exceptions,
+        "action_required": ["None"],
+        "positions": portfolio_rows,
+        "stats": stats,
+        "ai_brief": ai_brief,
+        "instrument_map": {str(k): v for k, v in instrument_map.items()},
+        "meta_last_debug": meta_debug,
+    })
     save_state(state)
 
     return {
         "status": "ok",
-        "message": "Daily task executed. Open / to view dashboard.",
-        "lots": stats.get("lots_count"),
-        "unique_instruments": stats.get("unique_instruments_count"),
+        "lots": stats["lots_count"],
+        "unique_instruments": stats["unique_instruments_count"],
         "mapped_symbols": mapped,
     }
 
@@ -531,64 +505,30 @@ async def run_daily():
 @app.get("/api/portfolio")
 async def api_portfolio():
     state = load_state()
-    return JSONResponse(
-        {
-            "date": state.get("date") or utc_now_iso(),
-            "stats": state.get("stats") or {},
-            "positions": state.get("positions") or [],
-        }
-    )
+    return JSONResponse({
+        "date": state.get("date") or utc_now_iso(),
+        "stats": state.get("stats") or {},
+        "positions": state.get("positions") or [],
+    })
 
 
 @app.get("/api/daily-brief")
 async def api_daily_brief():
     state = load_state()
-    return JSONResponse(
-        {
-            "date": state.get("date") or utc_now_iso(),
-            "material_events": state.get("material_events") or [],
-            "technical_exceptions": state.get("technical_exceptions") or [],
-            "action_required": state.get("action_required") or [],
-            "ai_brief": state.get("ai_brief") or "",
-            "stats": state.get("stats") or {},
-        }
-    )
+    return JSONResponse({
+        "date": state.get("date") or utc_now_iso(),
+        "material_events": state.get("material_events") or [],
+        "technical_exceptions": state.get("technical_exceptions") or [],
+        "action_required": state.get("action_required") or [],
+        "ai_brief": state.get("ai_brief") or "",
+        "stats": state.get("stats") or {},
+    })
 
 
-@app.get("/debug/position-keys")
-async def debug_position_keys():
+@app.get("/debug/meta-last")
+async def debug_meta_last():
     """
-    Returns the keys eToro sends in the first position (keys only, not values).
-    Safe for debugging mapping problems.
-    """
-    payload = await etoro_get_real_pnl()
-    positions = extract_positions(payload)
-    first = positions[0] if positions else {}
-    keys = sorted(list(first.keys())) if isinstance(first, dict) else []
-    return {
-        "note": "This shows only keys, not values.",
-        "raw_positions_count": len(positions),
-        "raw_first_position_keys": {"keys": keys, "total_keys": len(keys)},
-    }
-
-
-@app.get("/debug/instrument-map")
-async def debug_instrument_map():
-    """
-    Shows current cached instrumentID -> symbolFull mapping summary.
+    Shows the last metadata fetch attempts (status codes + counts) so we can diagnose mapping.
     """
     state = load_state()
-    m = state.get("instrument_map") or {}
-    # show only a small sample
-    sample = []
-    for k in list(m.keys())[:50]:
-        it = m.get(k) or {}
-        sample.append({
-            "instrumentID": k,
-            "symbolFull": it.get("symbolFull") or "",
-            "name": it.get("instrumentDisplayName") or it.get("displayName") or "",
-        })
-    return {
-        "cached_count": len(m),
-        "sample_first_50": sample,
-    }
+    return JSONResponse(state.get("meta_last_debug") or {"note": "No metadata debug stored yet. Run /tasks/daily."})
