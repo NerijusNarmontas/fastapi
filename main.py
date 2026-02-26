@@ -3,6 +3,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from collections import defaultdict
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -14,9 +15,11 @@ app = FastAPI(title="My AI Investing Agent")
 # Config (ENV VARS on Railway)
 # ----------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()       # eToro x-api-key
-ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip()     # eToro x-user-key
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()           # optional (keep empty if you don't want auth yet)
+
+ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()   # eToro x-api-key
+ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip() # eToro x-user-key
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()       # optional (keep empty if you don't want auth yet)
 
 # Files (Railway containers can restart; /tmp is fine for lightweight cache)
 STATE_PATH = "/tmp/investing_agent_state.json"
@@ -64,54 +67,110 @@ def normalize_number(x: Any) -> Optional[float]:
         return None
 
 
-def safe_div(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    if a is None or b is None or b == 0:
-        return None
-    return a / b
-
-
-def pick_ticker(p: Dict[str, Any]) -> str:
-    """
-    eToro returns keys like:
-      CID, instrumentID, unrealizedPnL, initialAmountInDollars, amount, etc.
-    Your debug shows CID is present - use it first.
-    """
-    ticker = (
-        p.get("symbol")
-        or p.get("ticker")
-        or p.get("CID")                # ✅ from your /debug/position-keys output
-        or p.get("cid")
-        or p.get("instrumentID")       # ✅ from your output
-        or p.get("instrumentId")
-        or p.get("InstrumentId")
-        or (p.get("instrument") or {}).get("symbol")
-        or (p.get("instrument") or {}).get("ticker")
-        or (p.get("position") or {}).get("CID")
-        or (p.get("position") or {}).get("instrumentID")
-        or "NA"
-    )
-    return str(ticker)
-
-
 def pick_unrealized_pnl(p: Dict[str, Any]) -> Optional[float]:
     return normalize_number(
-        p.get("unrealizedPnL")
-        or p.get("unrealized_pnl")
-        or p.get("unrealizedPnl")
+        p.get("unrealizedPnL") or p.get("unrealized_pnl") or p.get("unrealizedPnl")
     )
 
 
 def pick_initial_usd(p: Dict[str, Any]) -> Optional[float]:
     return normalize_number(
-        p.get("initialAmountInDollars")
-        or p.get("initial_amount_usd")
-        or p.get("initialAmount")
+        p.get("initialAmountInDollars") or p.get("initial_amount_usd") or p.get("initialAmount")
     )
 
 
-def pick_amount_usd(p: Dict[str, Any]) -> Optional[float]:
-    # Some payloads have "amount" as notional-ish
-    return normalize_number(p.get("amount"))
+def pick_instrument_id(p: Dict[str, Any]) -> Optional[int]:
+    iid = p.get("instrumentID") or p.get("instrumentId") or p.get("InstrumentId")
+    try:
+        return int(iid) if iid is not None else None
+    except Exception:
+        return None
+
+
+def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    eToro API commonly returns:
+    {
+      "clientPortfolio": {
+        "positions": [ ...lots... ]
+      }
+    }
+    We'll try multiple fallbacks.
+    """
+    if not isinstance(payload, dict):
+        return []
+    cp = payload.get("clientPortfolio") or payload.get("ClientPortfolio") or {}
+    if isinstance(cp, dict) and isinstance(cp.get("positions"), list):
+        return cp["positions"]
+    if isinstance(payload.get("positions"), list):
+        return payload["positions"]
+    return []
+
+
+def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> (List[Dict[str, Any]], Dict[str, int]):
+    """
+    eToro returns LOTS (many rows per same instrument). You want UNIQUE instruments (~65).
+    This groups lots by instrumentID and sums notional and PnL.
+    """
+    buckets = defaultdict(list)
+    for p in raw_positions:
+        iid = pick_instrument_id(p)
+        if iid is None:
+            continue
+        buckets[iid].append(p)
+
+    aggregated: List[Dict[str, Any]] = []
+    for iid, lots in buckets.items():
+        total_initial_usd = sum(float(pick_initial_usd(x) or 0) for x in lots)
+        total_unreal_pnl = sum(float(pick_unrealized_pnl(x) or 0) for x in lots)
+
+        aggregated.append({
+            "instrumentID": iid,
+            "lots": len(lots),
+            "initialAmountInDollars": total_initial_usd,
+            "unrealizedPnL": total_unreal_pnl,
+        })
+
+    aggregated.sort(key=lambda x: x.get("initialAmountInDollars", 0) or 0, reverse=True)
+
+    stats = {
+        "lots_count": len(raw_positions),
+        "unique_instruments_count": len(aggregated),
+    }
+    return aggregated, stats
+
+
+def build_portfolio_rows_from_aggregates(agg: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Build rows for dashboard + /api/portfolio from aggregated positions.
+    For now, ticker is instrumentID (numeric). Symbol mapping comes next step.
+    """
+    total_initial = sum(float(x.get("initialAmountInDollars") or 0) for x in agg) or 0.0
+
+    rows: List[Dict[str, Any]] = []
+    for a in agg:
+        initial = normalize_number(a.get("initialAmountInDollars"))
+        unreal = normalize_number(a.get("unrealizedPnL"))
+
+        weight_pct = None
+        if total_initial > 0 and initial is not None and initial > 0:
+            weight_pct = (initial / total_initial) * 100.0
+
+        pnl_pct = None
+        if unreal is not None and initial is not None and initial != 0:
+            pnl_pct = (unreal / initial) * 100.0
+
+        instrument_id = a.get("instrumentID")
+        rows.append({
+            "ticker": str(instrument_id) if instrument_id is not None else "NA",  # will become EQT/CCJ after mapping
+            "lots": str(a.get("lots", "")),
+            "weight_pct": (f"{weight_pct:.2f}" if weight_pct is not None else ""),
+            "pnl_pct": (f"{pnl_pct:.2f}" if pnl_pct is not None else ""),
+            "thesis_score": "",
+            "tech_status": "",
+        })
+
+    return rows
 
 
 # ----------------------------
@@ -119,10 +178,8 @@ def pick_amount_usd(p: Dict[str, Any]) -> Optional[float]:
 # ----------------------------
 async def etoro_get_real_pnl() -> Dict[str, Any]:
     """
-    Based on the eToro API portal page you showed:
-      GET https://public-api.etoro.com/api/v1/trading/info/real/pnl
-    Required headers:
-      x-api-key, x-user-key, x-request-id
+    GET https://public-api.etoro.com/api/v1/trading/info/real/pnl
+    Required headers: x-api-key, x-user-key, x-request-id
     """
     if not ETORO_API_KEY or not ETORO_USER_KEY:
         raise HTTPException(status_code=400, detail="Missing ETORO_API_KEY or ETORO_USER_KEY")
@@ -136,91 +193,16 @@ async def etoro_get_real_pnl() -> Dict[str, Any]:
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(url, headers=headers)
-
-    if r.status_code >= 400:
-        # return richer error so you see what happened on dashboard
-        try:
-            payload = r.json()
-        except Exception:
-            payload = {"text": r.text}
-        raise HTTPException(
-            status_code=r.status_code,
-            detail={"etoro_error": True, "status": r.status_code, "payload": payload},
-        )
-
-    return r.json()
-
-
-def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    The example response in the portal shows:
-      { "clientPortfolio": { "positions": [ ... ] } }
-    We'll try multiple fallbacks just in case.
-    """
-    if not isinstance(payload, dict):
-        return []
-
-    cp = payload.get("clientPortfolio") or payload.get("ClientPortfolio") or {}
-    if isinstance(cp, dict) and isinstance(cp.get("positions"), list):
-        return cp["positions"]
-
-    # fallback if positions at root
-    if isinstance(payload.get("positions"), list):
-        return payload["positions"]
-
-    return []
-
-
-def build_portfolio_rows(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Build rows for the dashboard + /api/portfolio
-    - ticker: CID first
-    - weight_pct: based on initialAmountInDollars where possible
-    - pnl_pct: unrealizedPnL / initialAmountInDollars * 100
-    """
-    # Compute totals for weights
-    initials: List[float] = []
-    for p in positions:
-        v = pick_initial_usd(p)
-        if v is not None and v > 0:
-            initials.append(v)
-
-    total_initial = sum(initials) if initials else 0.0
-
-    rows: List[Dict[str, Any]] = []
-    for p in positions:
-        ticker = pick_ticker(p)
-
-        unreal = pick_unrealized_pnl(p)
-        initial = pick_initial_usd(p)
-
-        pnl_pct = None
-        if unreal is not None and initial is not None and initial != 0:
-            pnl_pct = (unreal / initial) * 100.0
-
-        weight_pct = None
-        if total_initial > 0 and initial is not None and initial > 0:
-            weight_pct = (initial / total_initial) * 100.0
-
-        rows.append(
-            {
-                "ticker": ticker,
-                "weight_pct": (f"{weight_pct:.2f}" if weight_pct is not None else ""),
-                "pnl_pct": (f"{pnl_pct:.2f}" if pnl_pct is not None else ""),
-                "thesis_score": "",   # placeholder (we’ll add your thesis rules later)
-                "tech_status": "",    # placeholder (RSI/MAs later)
-            }
-        )
-
-    # Sort: biggest weight first (if available), else keep original
-    def sort_key(r: Dict[str, Any]):
-        try:
-            return -float(r["weight_pct"])
-        except Exception:
-            return 0.0
-
-    rows.sort(key=sort_key)
-    return rows
+        if r.status_code >= 400:
+            try:
+                payload = r.json()
+            except Exception:
+                payload = {"text": r.text}
+            raise HTTPException(
+                status_code=r.status_code,
+                detail={"etoro_error": True, "status": r.status_code, "payload": payload},
+            )
+        return r.json()
 
 
 # ----------------------------
@@ -230,7 +212,6 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
     if not OPENAI_API_KEY:
         return "OpenAI key not set. (Skipping AI brief.)"
 
-    # Keep prompt compact and safe.
     top = portfolio_rows[:25]
     lines = []
     for r in top:
@@ -238,12 +219,12 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
     portfolio_text = "\n".join(lines) if lines else "(no positions)"
 
     prompt = (
-        "You are an investing assistant. "
+        "You are an investing assistant. READ-ONLY.\n"
         "Given today's portfolio snapshot (tickers, weights, pnl%), write a short daily brief:\n"
         "- 5 bullet material events to check today (macro/sector angles)\n"
         "- 5 bullet risk items\n"
-        "- 5 bullet actions (trim/add/watch)\n"
-        "Do not give financial advice; use cautious language.\n\n"
+        "- 5 bullet watchlist items\n"
+        "Do NOT give buy/sell instructions. Do NOT give price predictions.\n\n"
         f"Portfolio:\n{portfolio_text}\n"
     )
 
@@ -251,7 +232,6 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
-
     body = {
         "model": "gpt-5-mini",
         "input": prompt,
@@ -260,32 +240,30 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
 
     async with httpx.AsyncClient(timeout=45) as client:
         r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=body)
+        if r.status_code >= 400:
+            try:
+                err = r.json()
+            except Exception:
+                err = {"text": r.text}
+            return f"OpenAI error {r.status_code}: {err}"
 
-    if r.status_code >= 400:
-        try:
-            err = r.json()
-        except Exception:
-            err = {"text": r.text}
-        return f"OpenAI error {r.status_code}: {err}"
+        data = r.json()
+        output_text = None
+        if isinstance(data, dict):
+            output_text = data.get("output_text")
 
-    data = r.json()
+            if not output_text and isinstance(data.get("output"), list):
+                chunks = []
+                for item in data["output"]:
+                    if not isinstance(item, dict):
+                        continue
+                    for c in item.get("content", []) or []:
+                        if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
+                            chunks.append(c.get("text", ""))
+                if chunks:
+                    output_text = "\n".join([x for x in chunks if x])
 
-    # Responses API: try common extraction patterns
-    # Some payloads return output_text under convenience field; fallback to raw JSON dump.
-    output_text = None
-    if isinstance(data, dict):
-        output_text = data.get("output_text")
-        if not output_text and isinstance(data.get("output"), list):
-            # Try to stitch content blocks
-            chunks = []
-            for item in data["output"]:
-                for c in item.get("content", []) if isinstance(item, dict) else []:
-                    if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
-                        chunks.append(c.get("text", ""))
-            if chunks:
-                output_text = "\n".join([x for x in chunks if x])
-
-    return output_text or "AI brief generated (but could not parse output_text)."
+        return output_text or "AI brief generated (but could not parse output_text)."
 
 
 # ----------------------------
@@ -294,18 +272,16 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     state = load_state()
-    last_update = state.get("date") or utc_now_iso()
 
+    last_update = state.get("date") or utc_now_iso()
     material_events = state.get("material_events") or []
     technical_exceptions = state.get("technical_exceptions") or []
-    action_required = state.get("action_required") or [
-        "Run /tasks/daily once to generate today's brief."
-    ]
+    action_required = state.get("action_required") or ["Run /tasks/daily once to generate today's brief."]
 
     portfolio = state.get("positions") or []
+    stats = state.get("stats") or {}
     ai_brief = state.get("ai_brief") or ""
 
-    # basic HTML, no templates
     def bullets(items: List[str]) -> str:
         if not items:
             return "<ul><li>None</li></ul>"
@@ -314,10 +290,11 @@ async def dashboard():
 
     rows_html = ""
     if portfolio:
-        for r in portfolio[:150]:
+        for r in portfolio[:200]:
             rows_html += (
                 "<tr>"
                 f"<td>{r.get('ticker','')}</td>"
+                f"<td>{r.get('lots','')}</td>"
                 f"<td>{r.get('weight_pct','')}</td>"
                 f"<td>{r.get('pnl_pct','')}</td>"
                 f"<td>{r.get('thesis_score','')}</td>"
@@ -325,60 +302,53 @@ async def dashboard():
                 "</tr>"
             )
     else:
-        rows_html = (
-            "<tr><td colspan='5'>No positions saved yet.</td></tr>"
-        )
+        rows_html = "<tr><td colspan='6'>No positions saved yet.</td></tr>"
+
+    lots_count = stats.get("lots_count", "")
+    uniq_count = stats.get("unique_instruments_count", "")
 
     html = f"""
     <html>
-    <head>
-      <meta charset="utf-8" />
-      <title>My AI Investing Agent</title>
-      <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; margin: 24px; }}
-        h1 {{ margin-bottom: 6px; }}
-        .muted {{ color: #666; font-size: 14px; }}
-        .card {{ border: 1px solid #e5e5e5; border-radius: 12px; padding: 18px; margin: 16px 0; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-        th, td {{ text-align: left; border-bottom: 1px solid #eee; padding: 8px; }}
-        code {{ background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }}
-        .brief {{ white-space: pre-wrap; background: #fafafa; border: 1px solid #eee; padding: 12px; border-radius: 10px; }}
-      </style>
-    </head>
-    <body>
-      <h1>My AI Investing Agent</h1>
-      <div class="muted">Last update: {last_update}</div>
+      <head>
+        <meta charset="utf-8" />
+        <title>My AI Investing Agent</title>
+        <style>
+          body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; margin: 24px; }}
+          table {{ border-collapse: collapse; width: 100%; }}
+          th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 14px; }}
+          th {{ background: #f5f5f5; text-align: left; }}
+          code {{ background: #f2f2f2; padding: 2px 6px; border-radius: 4px; }}
+        </style>
+      </head>
+      <body>
+        <h1>My AI Investing Agent</h1>
+        <p><b>Last update:</b> {last_update}</p>
+        <p><b>eToro:</b> Lots = {lots_count} | Unique instruments = {uniq_count}</p>
 
-      <div class="card">
         <h2>Material Events</h2>
         {bullets(material_events)}
-      </div>
 
-      <div class="card">
         <h2>Technical Exceptions</h2>
         {bullets(technical_exceptions)}
-      </div>
 
-      <div class="card">
         <h2>Action Required</h2>
         {bullets(action_required)}
-        <div class="muted">Run <code>/tasks/daily</code> once to refresh data.</div>
-      </div>
 
-      <div class="card">
+        <p>Run <code>/tasks/daily</code> once to refresh data.</p>
+
         <h2>AI Brief</h2>
-        <div class="brief">{ai_brief or "No brief yet. Run /tasks/daily."}</div>
-      </div>
+        <pre style="white-space: pre-wrap; background:#fafafa; border:1px solid #eee; padding:12px;">{ai_brief or "No brief yet. Run /tasks/daily."}</pre>
 
-      <div class="card">
-        <h2>Portfolio</h2>
-        <div class="muted">Note: ticker uses eToro <code>CID</code>. If you still see NA, open <code>/debug/position-keys</code>.</div>
+        <h2>Portfolio (unique instruments)</h2>
+        <p><i>Note: ticker is instrumentID for now. Next step: map instrumentID → real symbol (EQT, CCJ...).</i></p>
+
         <table>
           <thead>
             <tr>
               <th>Ticker</th>
+              <th>Lots</th>
               <th>Weight %</th>
-              <th>P&L %</th>
+              <th>P&amp;L %</th>
               <th>Thesis</th>
               <th>Tech</th>
             </tr>
@@ -387,12 +357,9 @@ async def dashboard():
             {rows_html}
           </tbody>
         </table>
-        <div class="muted" style="margin-top:10px;">
-          API: <code>/api/daily-brief</code> • <code>/api/portfolio</code>
-        </div>
-      </div>
 
-    </body>
+        <p>API: <code>/api/daily-brief</code> • <code>/api/portfolio</code></p>
+      </body>
     </html>
     """
     return HTMLResponse(html)
@@ -401,38 +368,42 @@ async def dashboard():
 @app.get("/tasks/daily")
 async def run_daily():
     state = load_state()
+
     material_events: List[str] = []
     technical_exceptions: List[str] = []
     action_required: List[str] = []
 
-    # System check
     material_events.append(
         f"System check: OpenAI key loaded={'True' if bool(OPENAI_API_KEY) else 'False'}, "
         f"eToro keys loaded={'True' if (bool(ETORO_API_KEY) and bool(ETORO_USER_KEY)) else 'False'}."
     )
 
+    raw_positions: List[Dict[str, Any]] = []
+    agg_positions: List[Dict[str, Any]] = []
+    stats: Dict[str, int] = {"lots_count": 0, "unique_instruments_count": 0}
+
     # Fetch eToro portfolio
     try:
         payload = await etoro_get_real_pnl()
-        positions = extract_positions(payload)
-        material_events.append(f"Pulled eToro portfolio successfully. Positions: {len(positions)}")
+        raw_positions = extract_positions(payload)
+        agg_positions, stats = aggregate_positions_by_instrument(raw_positions)
+
+        material_events.append(
+            f"Pulled eToro successfully. Lots: {stats['lots_count']} | Unique instruments: {stats['unique_instruments_count']}"
+        )
     except HTTPException as e:
-        # show exact detail in dashboard
         material_events.append(f"eToro API error: HTTP {e.status_code}")
         material_events.append(str(e.detail))
-        positions = []
+        raw_positions = []
+        agg_positions = []
+        stats = {"lots_count": 0, "unique_instruments_count": 0}
 
-    # Build rows
-    portfolio_rows = build_portfolio_rows(positions) if positions else []
-
-    # If still NA, prompt user to check keys
-    if portfolio_rows and all(r["ticker"] == "NA" for r in portfolio_rows[:20]):
-        action_required.append("Ticker still NA: open /debug/position-keys and confirm CID exists (it should).")
+    # Build rows (unique instruments)
+    portfolio_rows = build_portfolio_rows_from_aggregates(agg_positions) if agg_positions else []
 
     # AI Brief
-    ai_brief = ""
     if portfolio_rows:
-        technical_exceptions.append("Next: compute RSI/MACD/MAs/Volume/ADV per ticker + generate AI brief.")
+        technical_exceptions.append("Next steps: instrumentID→symbol mapping, then RSI/MACD/MAs/Volume/ADV.")
         ai_brief = await generate_openai_brief(portfolio_rows)
     else:
         ai_brief = "No positions found yet (or eToro call failed)."
@@ -446,12 +417,20 @@ async def run_daily():
             "material_events": material_events,
             "technical_exceptions": technical_exceptions,
             "action_required": action_required,
-            "positions": portfolio_rows,
+            "positions": portfolio_rows,       # aggregated view for dashboard
+            "stats": stats,                    # lots vs unique counts
             "ai_brief": ai_brief,
+            "raw_positions_count": len(raw_positions),
         }
     )
     save_state(state)
-    return {"status": "ok", "message": "Daily task executed. Open / to view dashboard."}
+
+    return {
+        "status": "ok",
+        "message": "Daily task executed. Open / to view dashboard.",
+        "lots": stats.get("lots_count"),
+        "unique_instruments": stats.get("unique_instruments_count"),
+    }
 
 
 @app.get("/api/portfolio")
@@ -460,6 +439,7 @@ async def api_portfolio():
     return JSONResponse(
         {
             "date": state.get("date") or utc_now_iso(),
+            "stats": state.get("stats") or {},
             "positions": state.get("positions") or [],
         }
     )
@@ -475,6 +455,7 @@ async def api_daily_brief():
             "technical_exceptions": state.get("technical_exceptions") or [],
             "action_required": state.get("action_required") or [],
             "ai_brief": state.get("ai_brief") or "",
+            "stats": state.get("stats") or {},
         }
     )
 
@@ -489,4 +470,8 @@ async def debug_position_keys():
     positions = extract_positions(payload)
     first = positions[0] if positions else {}
     keys = sorted(list(first.keys())) if isinstance(first, dict) else []
-    return {"note": "This shows only keys, not values.", "raw_first_position_keys": {"keys": keys, "total_keys": len(keys)}}
+    return {
+        "note": "This shows only keys, not values.",
+        "raw_positions_count": len(positions),
+        "raw_first_position_keys": {"keys": keys, "total_keys": len(keys)},
+    }
