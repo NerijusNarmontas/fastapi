@@ -2,13 +2,15 @@ import os
 import json
 import uuid
 import asyncio
+import traceback
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 # ============================================================
 # GOALS (your requirements)
@@ -19,8 +21,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 #    - Fallback candles: eToro (by instrumentId) with rate-limit backoff (fixes 429)
 # 4) Keep "empty Tech" understandable (OK / NO_TECH)
 # ============================================================
-
-app = FastAPI(title="My AI Investing Agent")
 
 # ----------------------------
 # ENV VARS (Railway)
@@ -45,7 +45,6 @@ CRYPTO_DENY = {
     x.strip().upper()
     for x in os.getenv(
         "CRYPTO_DENY",
-        # includes your crypto list: SEI, STRK, PYTH, HBAR, EIGEN, HYPE, W (Wormhole)
         "BTC,ETH,SOL,ADA,XRP,DOT,AVAX,LINK,OP,RUNE,WLD,JTO,ARB,ATOM,NEAR,APT,SUI,CRO,SEI,STRK,PYTH,HBAR,EIGEN,HYPE,W",
     ).split(",")
     if x.strip()
@@ -63,6 +62,46 @@ ETORO_REAL_PNL_URL = "https://public-api.etoro.com/api/v1/trading/info/real/pnl"
 ETORO_SEARCH_URL = "https://public-api.etoro.com/api/v1/market-data/search"
 ETORO_CANDLES_URL_TMPL = "https://public-api.etoro.com/api/v1/market-data/instruments/{instrumentId}/history/candles/asc/OneDay/{count}"
 
+# ============================================================
+# GLOBALS: shared HTTP + locks
+# ============================================================
+http_client: Optional[httpx.AsyncClient] = None
+
+_STATE_LOCK = asyncio.Lock()
+_DAILY_LOCK = asyncio.Lock()
+
+# Separate throttle for eToro fallback calls to avoid 429 bursts.
+_ETORO_FALLBACK_SEM = asyncio.Semaphore(int(os.getenv("ETORO_FALLBACK_CONCURRENCY", "2")))
+
+# ============================================================
+# APP (lifespan creates one shared AsyncClient)
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        limits=httpx.Limits(max_connections=60, max_keepalive_connections=20),
+        headers={"user-agent": "fastapi-investing-agent/1.0"},
+    )
+    yield
+    await http_client.aclose()
+    http_client = None
+
+
+app = FastAPI(title="My AI Investing Agent", lifespan=lifespan)
+
+# ============================================================
+# ERRORS: global handler so crashes are visible in logs
+# ============================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    print("UNHANDLED EXCEPTION:\n", tb)
+    # Don't leak stack traces publicly in production; keep response short.
+    return PlainTextResponse("Internal server error", status_code=500)
 
 # ============================================================
 # STATE
@@ -72,22 +111,30 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_PATH):
-        return {}
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+async def load_state() -> Dict[str, Any]:
+    async with _STATE_LOCK:
+        if not os.path.exists(STATE_PATH):
+            return {}
+        try:
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
 
 
-def save_state(state: Dict[str, Any]) -> None:
-    try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+async def save_state(state: Dict[str, Any]) -> None:
+    async with _STATE_LOCK:
+        tmp = STATE_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, STATE_PATH)  # atomic
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
 
 
 def require_admin(request: Request) -> None:
@@ -96,10 +143,25 @@ def require_admin(request: Request) -> None:
         if token != ADMIN_TOKEN:
             raise HTTPException(status_code=401, detail="Missing/invalid x-admin-token")
 
-
 # ============================================================
 # BASIC HELPERS
 # ============================================================
+
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, bool):
+            return int(x)
+        if isinstance(x, (int, float)):
+            return int(x)
+        s = str(x).strip()
+        if s == "":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
 
 def normalize_number(x: Any) -> Optional[float]:
     if x is None:
@@ -190,7 +252,6 @@ def is_crypto_instrument(instrument_id: int, ticker: str) -> bool:
         pass
     return is_crypto_ticker(ticker)
 
-
 # ============================================================
 # eTORO HTTP
 # ============================================================
@@ -210,26 +271,38 @@ def etoro_headers() -> Dict[str, str]:
 async def etoro_get_real_pnl() -> Dict[str, Any]:
     if not ETORO_API_KEY or not ETORO_USER_KEY:
         raise HTTPException(status_code=400, detail="Missing ETORO_API_KEY or ETORO_USER_KEY")
+    if http_client is None:
+        raise HTTPException(status_code=500, detail="HTTP client not ready")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(ETORO_REAL_PNL_URL, headers=etoro_headers())
-        if r.status_code >= 400:
-            try:
-                payload = r.json()
-            except Exception:
-                payload = {"text": r.text}
-            raise HTTPException(status_code=r.status_code, detail=payload)
-        return r.json()
+    r = await http_client.get(ETORO_REAL_PNL_URL, headers=etoro_headers())
+    if r.status_code >= 400:
+        try:
+            payload = r.json()
+        except Exception:
+            payload = {"text": r.text}
+        raise HTTPException(status_code=r.status_code, detail=payload)
+    return r.json()
 
 
 async def etoro_search(params: Dict[str, str]) -> Tuple[int, Any]:
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(ETORO_SEARCH_URL, headers=etoro_headers(), params=params)
+    """
+    Adds 429 backoff to search too (not only candles).
+    """
+    if http_client is None:
+        return 500, {"error": "http_client_not_ready"}
+
+    for attempt in range(1, 6):
+        r = await http_client.get(ETORO_SEARCH_URL, headers=etoro_headers(), params=params)
+        if r.status_code == 429:
+            await asyncio.sleep(min(16, 2 ** (attempt - 1)))
+            continue
         try:
             data = r.json()
         except Exception:
             data = {"text": r.text}
         return r.status_code, data
+
+    return 429, {"error": "rate_limited_exhausted", "params": params}
 
 
 def _extract_ticker_from_search_item(item: Dict[str, Any]) -> str:
@@ -259,7 +332,8 @@ async def map_instrument_ids_to_tickers_search(instrument_ids: List[int], state:
 
     debug = {"requested": len(ids), "mapped": 0, "failed": 0, "samples": []}
 
-    sem = asyncio.Semaphore(10)
+    # gentler concurrency to avoid rate limits
+    sem = asyncio.Semaphore(int(os.getenv("ETORO_SEARCH_CONCURRENCY", "5")))
 
     async def one(iid: int):
         async with sem:
@@ -293,7 +367,7 @@ async def map_instrument_ids_to_tickers_search(instrument_ids: List[int], state:
     state["ticker_cache"] = {str(k): v for k, v in cache.items()}
     state["mapping"] = {"cached": len([iid for iid in ids if iid in cache and not looks_like_numeric_id(cache[iid])]), "total": len(ids)}
     state["mapping_last_debug"] = {"missing": len(missing), "cached_total": len(cache), "total_today": len(ids), "debug": debug}
-    save_state(state)
+    await save_state(state)
 
     return cache, debug
 
@@ -301,29 +375,30 @@ async def map_instrument_ids_to_tickers_search(instrument_ids: List[int], state:
 async def etoro_get_daily_candles(instrument_id: int, count: int = 260) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Fallback candles directly from eToro by instrumentId.
-    FIX: rate-limit backoff for HTTP 429 (your BOE.ASX showed 429).
+    FIX: rate-limit backoff for HTTP 429.
     """
+    if http_client is None:
+        return [], {"provider": "etoro", "instrumentId": instrument_id, "status": "http_client_not_ready"}
+
     url = ETORO_CANDLES_URL_TMPL.format(instrumentId=instrument_id, count=count)
     dbg = {"provider": "etoro", "instrumentId": instrument_id, "requested": count, "status": "init", "http": None, "error": None}
 
     for attempt in range(1, 6):  # up to 5 tries
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.get(url, headers=etoro_headers())
-                dbg["http"] = r.status_code
+            r = await http_client.get(url, headers=etoro_headers())
+            dbg["http"] = r.status_code
 
-                if r.status_code == 429:
-                    dbg["status"] = "rate_limited"
-                    # Backoff: 1s,2s,4s,8s,16s
-                    await asyncio.sleep(min(16, 2 ** (attempt - 1)))
-                    continue
+            if r.status_code == 429:
+                dbg["status"] = "rate_limited"
+                await asyncio.sleep(min(16, 2 ** (attempt - 1)))
+                continue
 
-                if r.status_code >= 400:
-                    dbg["status"] = "http_error"
-                    dbg["error"] = (r.text or "")[:300]
-                    return [], dbg
+            if r.status_code >= 400:
+                dbg["status"] = "http_error"
+                dbg["error"] = (r.text or "")[:300]
+                return [], dbg
 
-                data = r.json()
+            data = r.json()
         except Exception as e:
             dbg["status"] = "exception"
             dbg["error"] = repr(e)
@@ -350,7 +425,6 @@ async def etoro_get_daily_candles(instrument_id: int, count: int = 260) -> Tuple
     dbg["status"] = "rate_limited_exhausted" if dbg.get("http") == 429 else dbg["status"]
     return [], dbg
 
-
 # ============================================================
 # STOCK CANDLES (Stooq primary)
 # ============================================================
@@ -360,6 +434,9 @@ async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[D
     Fetch daily OHLCV candles from Stooq CSV endpoint.
     For US listings, Stooq usually expects ".us".
     """
+    if http_client is None:
+        return [], {"provider": "stooq", "input": ticker, "status": "http_client_not_ready"}
+
     t = (ticker or "").strip()
     dbg: Dict[str, Any] = {"provider": "stooq", "input": ticker, "requested": count, "status": "init", "http": None, "error": None}
 
@@ -379,21 +456,19 @@ async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[D
     url = "https://stooq.com/q/d/l/"
     params = {"s": s, "i": "d"}
 
-    # retry loop (helps transient ConnectError)
     last_err = None
     text = ""
     for attempt in range(1, 4):
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                r = await client.get(url, params=params, headers={"accept": "text/csv"})
-                dbg["http"] = r.status_code
-                if r.status_code >= 400:
-                    dbg["status"] = "http_error"
-                    dbg["error"] = (r.text or "")[:300]
-                    return [], dbg
-                text = r.text or ""
-                last_err = None
-                break
+            r = await http_client.get(url, params=params, headers={"accept": "text/csv"})
+            dbg["http"] = r.status_code
+            if r.status_code >= 400:
+                dbg["status"] = "http_error"
+                dbg["error"] = (r.text or "")[:300]
+                return [], dbg
+            text = r.text or ""
+            last_err = None
+            break
         except Exception as e:
             last_err = e
             await asyncio.sleep(0.6 * attempt)
@@ -435,7 +510,6 @@ async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[D
     dbg["status"] = "ok"
     dbg["rows"] = len(candles)
     return candles, dbg
-
 
 # ============================================================
 # TECHNICAL INDICATORS
@@ -511,14 +585,9 @@ def tech_tags(t: Dict[str, Any]) -> str:
 
     return " | ".join(tags)
 
-
 # ============================================================
 # TECH PIPELINE
 # ============================================================
-
-# Separate throttle for eToro fallback calls to avoid 429 bursts.
-_ETORO_FALLBACK_SEM = asyncio.Semaphore(int(os.getenv("ETORO_FALLBACK_CONCURRENCY", "2")))
-
 
 async def compute_technicals_for_ids(
     instrument_ids: List[int],
@@ -543,7 +612,7 @@ async def compute_technicals_for_ids(
         "samples": [],
     }
 
-    sem = asyncio.Semaphore(7)
+    sem = asyncio.Semaphore(int(os.getenv("TECH_CONCURRENCY", "6")))
 
     async def one(iid: int):
         async with sem:
@@ -631,7 +700,7 @@ async def compute_technicals_for_ids(
                 "adv20": adv20,
                 "dollar_adv20": dollar_adv20,
                 "illiquid": illiquid,
-                "candles_debug": cdbg,  # keep debug for diagnosis
+                "candles_debug": cdbg,
             }
 
             debug["computed"] += 1
@@ -646,7 +715,6 @@ async def compute_technicals_for_ids(
 
     await asyncio.gather(*(one(i) for i in ids))
     return tech_map, debug
-
 
 # ============================================================
 # PRESENTATION LAYER
@@ -734,7 +802,6 @@ def deterministic_brief(rows: List[Dict[str, Any]]) -> str:
     lines.append("Notes: No buy/sell instructions. Use as a checklist for research.")
     return "\n".join(lines)
 
-
 # ============================================================
 # DISCORD (optional)
 # ============================================================
@@ -742,12 +809,12 @@ def deterministic_brief(rows: List[Dict[str, Any]]) -> str:
 async def discord_notify(text: str) -> None:
     if not DISCORD_WEBHOOK_URL:
         return
+    if http_client is None:
+        return
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(DISCORD_WEBHOOK_URL, json={"content": text})
+        await http_client.post(DISCORD_WEBHOOK_URL, json={"content": text})
     except Exception:
         pass
-
 
 # ============================================================
 # ROUTES
@@ -755,7 +822,7 @@ async def discord_notify(text: str) -> None:
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    state = load_state()
+    state = await load_state()
 
     last_update = state.get("date") or utc_now_iso()
     material_events = state.get("material_events") or []
@@ -787,6 +854,12 @@ async def dashboard():
     if not rows_html:
         rows_html = "<tr><td colspan='6'>No positions saved yet.</td></tr>"
 
+    req = safe_int(tech_debug.get("requested", 0))
+    skp = safe_int(tech_debug.get("skipped", 0))
+    computed = safe_int(tech_debug.get("computed", 0))
+    failed = safe_int(tech_debug.get("failed", 0))
+    denom = max(0, req - skp)
+
     html = f"""
     <html>
       <head>
@@ -807,7 +880,7 @@ async def dashboard():
         <p><b>Crypto filter:</b> instrumentId >= {CRYPTO_ID_MIN} OR ticker in denylist</p>
         <p><b>eToro:</b> Lots = {stats.get("lots_count","")} | Unique instruments = {stats.get("unique_instruments_count","")}</p>
         <p><b>Mapping cache:</b> {mapping.get("cached","")}/{mapping.get("total","")} cached (real tickers)</p>
-        <p><b>Technicals:</b> computed {tech_debug.get("computed","")}/{max(0, int(tech_debug.get("requested",0) or 0) - int(tech_debug.get("skipped",0) or 0))} (failed {tech_debug.get("failed","")}, skipped {tech_debug.get("skipped",0)})</p>
+        <p><b>Technicals:</b> computed {computed}/{denom} (failed {failed}, skipped {skp})</p>
 
         <h2>Material Events</h2>
         {bullets(material_events)}
@@ -849,80 +922,83 @@ async def dashboard():
 
 @app.get("/tasks/daily")
 async def run_daily():
-    state = load_state()
+    async with _DAILY_LOCK:
+        state = await load_state()
 
-    material_events: List[str] = []
-    technical_exceptions: List[str] = []
+        material_events: List[str] = []
+        technical_exceptions: List[str] = []
 
-    material_events.append(
-        f"System check: OpenAI={'True' if bool(OPENAI_API_KEY) else 'False'}, "
-        f"Discord={'True' if bool(DISCORD_WEBHOOK_URL) else 'False'}, "
-        f"eToro keys={'True' if (bool(ETORO_API_KEY) and bool(ETORO_USER_KEY)) else 'False'}."
-    )
+        material_events.append(
+            f"System check: OpenAI={'True' if bool(OPENAI_API_KEY) else 'False'}, "
+            f"Discord={'True' if bool(DISCORD_WEBHOOK_URL) else 'False'}, "
+            f"eToro keys={'True' if (bool(ETORO_API_KEY) and bool(ETORO_USER_KEY)) else 'False'}."
+        )
 
-    payload = await etoro_get_real_pnl()
-    raw_positions = extract_positions(payload)
-    agg_positions, stats = aggregate_positions_by_instrument(raw_positions)
+        payload = await etoro_get_real_pnl()
+        raw_positions = extract_positions(payload)
+        agg_positions, stats = aggregate_positions_by_instrument(raw_positions)
 
-    material_events.append(
-        f"Pulled eToro successfully. Lots: {stats['lots_count']} | Unique instruments: {stats['unique_instruments_count']}"
-    )
+        material_events.append(
+            f"Pulled eToro successfully. Lots: {stats['lots_count']} | Unique instruments: {stats['unique_instruments_count']}"
+        )
 
-    instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
+        instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
 
-    # 1) Mapping
-    ticker_cache, _map_dbg = await map_instrument_ids_to_tickers_search(instrument_ids, state)
-    mapping = state.get("mapping") or {"cached": 0, "total": len(instrument_ids)}
-    material_events.append(f"Resolved tickers: {mapping.get('cached',0)}/{mapping.get('total',len(instrument_ids))} (see /debug/mapping-last)")
+        # 1) Mapping
+        ticker_cache, _map_dbg = await map_instrument_ids_to_tickers_search(instrument_ids, state)
+        mapping = state.get("mapping") or {"cached": 0, "total": len(instrument_ids)}
+        material_events.append(
+            f"Resolved tickers: {mapping.get('cached',0)}/{mapping.get('total',len(instrument_ids))} (see /debug/mapping-last)"
+        )
 
-    # 2) Technicals
-    tech_map, tech_dbg = await compute_technicals_for_ids(instrument_ids, ticker_cache)
-    state["tech_debug"] = tech_dbg
+        # 2) Technicals
+        tech_map, tech_dbg = await compute_technicals_for_ids(instrument_ids, ticker_cache)
+        state["tech_debug"] = tech_dbg
 
-    if tech_dbg.get("failed", 0) > 0:
-        technical_exceptions.append(f"Candles missing for {tech_dbg.get('failed')} instruments (see /debug/tech-last).")
-    if tech_dbg.get("skipped", 0) > 0:
-        material_events.append(f"Skipped {tech_dbg.get('skipped')} instruments (no ticker / crypto excluded).")
+        if tech_dbg.get("failed", 0) > 0:
+            technical_exceptions.append(f"Candles missing for {tech_dbg.get('failed')} instruments (see /debug/tech-last).")
+        if tech_dbg.get("skipped", 0) > 0:
+            material_events.append(f"Skipped {tech_dbg.get('skipped')} instruments (no ticker / crypto excluded).")
 
-    # 3) Portfolio rows
-    portfolio_rows = build_portfolio_rows(agg_positions, ticker_cache, tech_map)
+        # 3) Portfolio rows
+        portfolio_rows = build_portfolio_rows(agg_positions, ticker_cache, tech_map)
 
-    # 4) Brief
-    brief = deterministic_brief(portfolio_rows)
+        # 4) Brief
+        brief = deterministic_brief(portfolio_rows)
 
-    # 5) Discord notify (optional)
-    tech_done = tech_dbg.get("computed", 0)
-    tech_req = tech_dbg.get("requested", len(instrument_ids))
-    tech_skip = tech_dbg.get("skipped", 0)
-    tech_den = max(0, int(tech_req) - int(tech_skip))
-    await discord_notify(f"✅ Daily done | tickers {mapping.get('cached',0)}/{len(instrument_ids)} | tech {tech_done}/{tech_den}")
+        # 5) Discord notify (optional)
+        tech_done = safe_int(tech_dbg.get("computed", 0))
+        tech_req = safe_int(tech_dbg.get("requested", len(instrument_ids)))
+        tech_skip = safe_int(tech_dbg.get("skipped", 0))
+        tech_den = max(0, tech_req - tech_skip)
+        await discord_notify(f"✅ Daily done | tickers {mapping.get('cached',0)}/{len(instrument_ids)} | tech {tech_done}/{tech_den}")
 
-    state.update({
-        "date": utc_now_iso(),
-        "material_events": material_events,
-        "technical_exceptions": technical_exceptions,
-        "action_required": ["None"],
-        "positions": portfolio_rows,
-        "stats": stats,
-        "brief": brief,
-        "mapping": mapping,
-    })
-    save_state(state)
+        state.update({
+            "date": utc_now_iso(),
+            "material_events": material_events,
+            "technical_exceptions": technical_exceptions,
+            "action_required": ["None"],
+            "positions": portfolio_rows,
+            "stats": stats,
+            "brief": brief,
+            "mapping": mapping,
+        })
+        await save_state(state)
 
-    return {
-        "status": "ok",
-        "lots": stats["lots_count"],
-        "unique_instruments": stats["unique_instruments_count"],
-        "mapped_symbols": mapping.get("cached", 0),
-        "technicals_computed": tech_done,
-        "technicals_requested": tech_den,
-        "technicals_skipped": tech_skip,
-    }
+        return {
+            "status": "ok",
+            "lots": stats["lots_count"],
+            "unique_instruments": stats["unique_instruments_count"],
+            "mapped_symbols": mapping.get("cached", 0),
+            "technicals_computed": tech_done,
+            "technicals_requested": tech_den,
+            "technicals_skipped": tech_skip,
+        }
 
 
 @app.get("/api/portfolio")
 async def api_portfolio():
-    state = load_state()
+    state = await load_state()
     return JSONResponse({
         "date": state.get("date") or utc_now_iso(),
         "stats": state.get("stats") or {},
@@ -934,7 +1010,7 @@ async def api_portfolio():
 
 @app.get("/api/daily-brief")
 async def api_daily_brief():
-    state = load_state()
+    state = await load_state()
     return JSONResponse({
         "date": state.get("date") or utc_now_iso(),
         "material_events": state.get("material_events") or [],
@@ -949,13 +1025,13 @@ async def api_daily_brief():
 
 @app.get("/debug/mapping-last")
 async def debug_mapping_last():
-    state = load_state()
+    state = await load_state()
     return JSONResponse(state.get("mapping_last_debug") or {"note": "Run /tasks/daily first."})
 
 
 @app.get("/debug/tech-last")
 async def debug_tech_last():
-    state = load_state()
+    state = await load_state()
     return JSONResponse(state.get("tech_debug") or {"note": "Run /tasks/daily first."})
 
 
@@ -989,7 +1065,7 @@ async def admin_seed_mapping(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Body must be JSON object: {instrumentId: ticker}")
 
-    state = load_state()
+    state = await load_state()
     cache_raw = state.get("ticker_cache") or {}
 
     seeded = 0
@@ -1004,5 +1080,5 @@ async def admin_seed_mapping(request: Request):
             seeded += 1
 
     state["ticker_cache"] = cache_raw
-    save_state(state)
+    await save_state(state)
     return {"status": "ok", "seeded": seeded, "note": "Run /tasks/daily again."}
