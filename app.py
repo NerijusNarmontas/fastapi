@@ -1,4 +1,3 @@
-# app.py
 import os
 import json
 from fastapi import FastAPI, HTTPException
@@ -14,13 +13,16 @@ def health():
 
 @app.post("/run")
 def run():
-    # Runs the agent now and returns the result
     return run_agent()
 
 @app.get("/last")
 def last():
-    # Returns last saved output if it exists
     if not os.path.exists(OUTPUT_PATH):
         raise HTTPException(status_code=404, detail=f"{OUTPUT_PATH} not found yet. Call POST /run first.")
     with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
+# ✅ This is the route you wanted
+@app.get("/tasks/daily")
+def tasks_daily():
+    return run_agent()
