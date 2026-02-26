@@ -40,10 +40,16 @@ class FetchResult:
 class Timer:
     def __enter__(self):
         self.t0 = time.perf_counter()
+        self.elapsed_ms = 0  # always exists
         return self
 
+    @property
+    def ms(self) -> int:
+        # safe to call anytime (inside or after the with-block)
+        return int((time.perf_counter() - self.t0) * 1000)
+
     def __exit__(self, exc_type, exc, tb):
-        self.elapsed_ms = int((time.perf_counter() - self.t0) * 1000)
+        self.elapsed_ms = self.ms
 
 
 def safe_err(e: Exception) -> str:
@@ -388,18 +394,24 @@ def run_agent() -> Dict[str, Any]:
         facts = facts_db.get(sym, {})
         results[sym]["thesis"] = score_energy_thesis(sym, facts, rules)
 
+        # News
         with Timer() as t:
             try:
                 http_code, items = fetch_news_google_rss(sym, company_name=company_names.get(sym))
                 status = "ok" if items else "empty"
                 if items:
                     news_fetched += 1
-                telemetry.append(FetchResult(sym, "google_rss", "news", status, http_code, t.elapsed_ms, len(items)).to_dict())
+                telemetry.append(
+                    FetchResult(sym, "google_rss", "news", status, http_code, t.ms, len(items)).to_dict()
+                )
                 results[sym]["news"] = items
             except Exception as e:
-                telemetry.append(FetchResult(sym, "google_rss", "news", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict())
+                telemetry.append(
+                    FetchResult(sym, "google_rss", "news", "error", None, t.ms, 0, safe_err(e)).to_dict()
+                )
                 results[sym]["news"] = []
 
+        # Filings (rate-limit a bit to avoid SEC 429)
         with Timer() as t:
             try:
                 http_code, items = fetch_latest_filings_sec(sym, cik_map, sec_user_agent)
@@ -409,10 +421,14 @@ def run_agent() -> Dict[str, Any]:
                     status = "ok" if items else "empty"
                 if items:
                     filings_fetched += 1
-                telemetry.append(FetchResult(sym, "sec_edgar", "filings", status, http_code, t.elapsed_ms, len(items)).to_dict())
+                telemetry.append(
+                    FetchResult(sym, "sec_edgar", "filings", status, http_code, t.ms, len(items)).to_dict()
+                )
                 results[sym]["filings"] = items
             except Exception as e:
-                telemetry.append(FetchResult(sym, "sec_edgar", "filings", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict())
+                telemetry.append(
+                    FetchResult(sym, "sec_edgar", "filings", "error", None, t.ms, 0, safe_err(e)).to_dict()
+                )
                 results[sym]["filings"] = []
 
         time.sleep(0.35)
