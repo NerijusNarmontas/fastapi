@@ -11,11 +11,13 @@ from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================================
-# CONFIG / GOALS
-# - Stocks only (crypto excluded)
-# - Technicals computed (RSI/MACD/SMA + liquidity flags)
-# - Primary candles: Stooq (free)
-# - Fallback candles: eToro by instrumentId (more robust, fixes non-US + Stooq outages)
+# GOALS (your requirements)
+# 1) Stocks-only view (crypto excluded)
+# 2) Crypto tickers like W (Wormhole) must be removed even if the symbol collides with a stock
+# 3) Technicals computed reliably:
+#    - Primary candles: Stooq (free)
+#    - Fallback candles: eToro (by instrumentId) with rate-limit backoff (fixes 429)
+# 4) Keep "empty Tech" understandable (OK / NO_TECH)
 # ============================================================
 
 app = FastAPI(title="My AI Investing Agent")
@@ -33,15 +35,24 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()                  # optional
 
 # Universe controls
 EXCLUDE_CRYPTO = os.getenv("EXCLUDE_CRYPTO", "true").strip().lower() in ("1", "true", "yes", "y")
+
+# IMPORTANT:
+# You confirmed: "W" in your eToro portfolio is Wormhole crypto.
+# We will classify crypto using BOTH:
+#   - instrumentId heuristic (most crypto IDs are >= 100000 in your data)
+#   - denylist fallback
 CRYPTO_DENY = {
     x.strip().upper()
     for x in os.getenv(
-        # NOTE: CRO added (your debug showed CRO slipping through).
         "CRYPTO_DENY",
-        "BTC,ETH,SOL,ADA,XRP,DOT,AVAX,LINK,OP,RUNE,WLD,JTO,ARB,ATOM,NEAR,APT,SUI,CRO,SEI, W, STRK, PYTH, HBAR, EIGEN, HYPE",
+        # includes your crypto list: SEI, STRK, PYTH, HBAR, EIGEN, HYPE, W (Wormhole)
+        "BTC,ETH,SOL,ADA,XRP,DOT,AVAX,LINK,OP,RUNE,WLD,JTO,ARB,ATOM,NEAR,APT,SUI,CRO,SEI,STRK,PYTH,HBAR,EIGEN,HYPE,W",
     ).split(",")
     if x.strip()
 }
+
+# Heuristic: in your dataset crypto instrumentIDs look like 100000+
+CRYPTO_ID_MIN = int(os.getenv("CRYPTO_ID_MIN", "100000"))
 
 STATE_PATH = "/tmp/investing_agent_state.json"
 
@@ -150,20 +161,34 @@ def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tu
     return aggregated, stats
 
 
+def looks_like_numeric_id(s: str) -> bool:
+    return (s or "").strip().isdigit()
+
+
 def is_crypto_ticker(ticker: str) -> bool:
     t = (ticker or "").upper().strip()
     if not t:
         return False
     if t in CRYPTO_DENY:
         return True
-    # common crypto pair shapes
     if t.endswith("-USD") or t.endswith("USD") or t.endswith("USDT"):
         return True
     return False
 
 
-def looks_like_numeric_id(s: str) -> bool:
-    return (s or "").strip().isdigit()
+def is_crypto_instrument(instrument_id: int, ticker: str) -> bool:
+    """
+    Strong crypto classification:
+    - if instrument_id >= CRYPTO_ID_MIN => crypto (matches your eToro pattern)
+    - else fallback to denylist rules
+    This is what makes "W" safe: Wayfair W would NOT have a 100xxx id.
+    """
+    try:
+        if int(instrument_id) >= CRYPTO_ID_MIN:
+            return True
+    except Exception:
+        pass
+    return is_crypto_ticker(ticker)
 
 
 # ============================================================
@@ -217,12 +242,11 @@ def _extract_ticker_from_search_item(item: Dict[str, Any]) -> str:
 
 async def map_instrument_ids_to_tickers_search(instrument_ids: List[int], state: Dict[str, Any]) -> Tuple[Dict[int, str], Dict[str, Any]]:
     """
-    Tries to map instrumentId -> ticker using /market-data/search.
+    Maps instrumentId -> ticker using /market-data/search.
     Uses cache stored in state['ticker_cache'].
     """
     ids = sorted(set(int(x) for x in instrument_ids if x is not None))
 
-    # load cache
     cache_raw = state.get("ticker_cache") or {}
     cache: Dict[int, str] = {}
     for k, v in cache_raw.items():
@@ -239,7 +263,6 @@ async def map_instrument_ids_to_tickers_search(instrument_ids: List[int], state:
 
     async def one(iid: int):
         async with sem:
-            # try several param shapes (eToro can be picky)
             patterns = [
                 {"instrumentId": str(iid), "pageSize": "5", "pageNumber": "1"},
                 {"internalInstrumentId": str(iid), "pageSize": "5", "pageNumber": "1"},
@@ -267,7 +290,6 @@ async def map_instrument_ids_to_tickers_search(instrument_ids: List[int], state:
 
     await asyncio.gather(*(one(i) for i in missing))
 
-    # save cache back
     state["ticker_cache"] = {str(k): v for k, v in cache.items()}
     state["mapping"] = {"cached": len([iid for iid in ids if iid in cache and not looks_like_numeric_id(cache[iid])]), "total": len(ids)}
     state["mapping_last_debug"] = {"missing": len(missing), "cached_total": len(cache), "total_today": len(ids), "debug": debug}
@@ -279,43 +301,54 @@ async def map_instrument_ids_to_tickers_search(instrument_ids: List[int], state:
 async def etoro_get_daily_candles(instrument_id: int, count: int = 260) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Fallback candles directly from eToro by instrumentId.
-    Returns (candles, debug).
+    FIX: rate-limit backoff for HTTP 429 (your BOE.ASX showed 429).
     """
     url = ETORO_CANDLES_URL_TMPL.format(instrumentId=instrument_id, count=count)
     dbg = {"provider": "etoro", "instrumentId": instrument_id, "requested": count, "status": "init", "http": None, "error": None}
 
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(url, headers=etoro_headers())
-            dbg["http"] = r.status_code
-            if r.status_code >= 400:
-                dbg["status"] = "http_error"
-                dbg["error"] = (r.text or "")[:300]
-                return [], dbg
-            data = r.json()
-    except Exception as e:
-        dbg["status"] = "exception"
-        dbg["error"] = repr(e)
-        return [], dbg
+    for attempt in range(1, 6):  # up to 5 tries
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(url, headers=etoro_headers())
+                dbg["http"] = r.status_code
 
-    candles: List[Dict[str, Any]] = []
-    if isinstance(data, dict):
-        # common shape: {"candles":[{"candles":[{...}, ...]}]}
-        if isinstance(data.get("candles"), list) and data["candles"]:
-            g0 = data["candles"][0]
-            if isinstance(g0, dict) and isinstance(g0.get("candles"), list):
-                candles = [c for c in g0["candles"] if isinstance(c, dict)]
-        # fallback shape: {"items":[...]}
-        elif isinstance(data.get("items"), list):
-            candles = [c for c in data["items"] if isinstance(c, dict)]
+                if r.status_code == 429:
+                    dbg["status"] = "rate_limited"
+                    # Backoff: 1s,2s,4s,8s,16s
+                    await asyncio.sleep(min(16, 2 ** (attempt - 1)))
+                    continue
 
-    if not candles:
-        dbg["status"] = "empty"
-        return [], dbg
+                if r.status_code >= 400:
+                    dbg["status"] = "http_error"
+                    dbg["error"] = (r.text or "")[:300]
+                    return [], dbg
 
-    dbg["status"] = "ok"
-    dbg["rows"] = len(candles)
-    return candles, dbg
+                data = r.json()
+        except Exception as e:
+            dbg["status"] = "exception"
+            dbg["error"] = repr(e)
+            await asyncio.sleep(0.5 * attempt)
+            continue
+
+        candles: List[Dict[str, Any]] = []
+        if isinstance(data, dict):
+            if isinstance(data.get("candles"), list) and data["candles"]:
+                g0 = data["candles"][0]
+                if isinstance(g0, dict) and isinstance(g0.get("candles"), list):
+                    candles = [c for c in g0["candles"] if isinstance(c, dict)]
+            elif isinstance(data.get("items"), list):
+                candles = [c for c in data["items"] if isinstance(c, dict)]
+
+        if not candles:
+            dbg["status"] = "empty"
+            return [], dbg
+
+        dbg["status"] = "ok"
+        dbg["rows"] = len(candles)
+        return candles, dbg
+
+    dbg["status"] = "rate_limited_exhausted" if dbg.get("http") == 429 else dbg["status"]
+    return [], dbg
 
 
 # ============================================================
@@ -346,7 +379,7 @@ async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[D
     url = "https://stooq.com/q/d/l/"
     params = {"s": s, "i": "d"}
 
-    # retry loop (fixes transient ConnectError on Railway sometimes)
+    # retry loop (helps transient ConnectError)
     last_err = None
     text = ""
     for attempt in range(1, 4):
@@ -483,6 +516,10 @@ def tech_tags(t: Dict[str, Any]) -> str:
 # TECH PIPELINE
 # ============================================================
 
+# Separate throttle for eToro fallback calls to avoid 429 bursts.
+_ETORO_FALLBACK_SEM = asyncio.Semaphore(int(os.getenv("ETORO_FALLBACK_CONCURRENCY", "2")))
+
+
 async def compute_technicals_for_ids(
     instrument_ids: List[int],
     ticker_map: Dict[int, str],
@@ -491,9 +528,9 @@ async def compute_technicals_for_ids(
     """
     Stocks-only technicals:
       - skip missing tickers / numeric ids
-      - skip crypto (EXCLUDE_CRYPTO)
+      - skip crypto (EXCLUDE_CRYPTO) using instrumentId heuristic + denylist
       - primary candles: Stooq
-      - fallback candles: eToro (by instrumentId) if Stooq fails/no data/connection error
+      - fallback candles: eToro (rate-limit protected + low concurrency)
     """
     ids = sorted(set(int(x) for x in instrument_ids if x is not None))
     tech_map: Dict[int, Dict[str, Any]] = {}
@@ -514,29 +551,37 @@ async def compute_technicals_for_ids(
 
             if not ticker or looks_like_numeric_id(ticker):
                 debug["skipped"] += 1
-                if len(debug["samples"]) < 15:
+                if len(debug["samples"]) < 20:
                     debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "skipped_no_ticker"})
                 return
 
-            if EXCLUDE_CRYPTO and is_crypto_ticker(ticker):
+            if EXCLUDE_CRYPTO and is_crypto_instrument(iid, ticker):
                 debug["skipped"] += 1
-                if len(debug["samples"]) < 15:
+                if len(debug["samples"]) < 20:
                     debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "skipped_crypto"})
                 return
 
             # 1) Stooq
             candles, cdbg = await stooq_get_daily_candles(ticker, count=candles_count)
 
-            # 2) Fallback to eToro candles if Stooq fails
+            # 2) Fallback to eToro candles if Stooq fails/no data
             if (not candles) or (len(candles) < 80):
-                ecandles, edbg = await etoro_get_daily_candles(iid, count=candles_count)
+                async with _ETORO_FALLBACK_SEM:
+                    ecandles, edbg = await etoro_get_daily_candles(iid, count=candles_count)
+
                 if ecandles and len(ecandles) >= 80:
                     candles = ecandles
                     cdbg = {"stooq": cdbg, "fallback": edbg}
                 else:
                     debug["failed"] += 1
-                    if len(debug["samples"]) < 15:
-                        debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "no_candles", "cdbg": cdbg, "fallback": edbg})
+                    if len(debug["samples"]) < 20:
+                        debug["samples"].append({
+                            "instrumentID": iid,
+                            "ticker": ticker,
+                            "status": "no_candles",
+                            "cdbg": cdbg,
+                            "fallback": edbg
+                        })
                     return
 
             closes = [normalize_number(c.get("close")) for c in candles]
@@ -546,7 +591,7 @@ async def compute_technicals_for_ids(
 
             if len(closes) < 80:
                 debug["failed"] += 1
-                if len(debug["samples"]) < 15:
+                if len(debug["samples"]) < 20:
                     debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "not_enough_closes"})
                 return
 
@@ -586,12 +631,18 @@ async def compute_technicals_for_ids(
                 "adv20": adv20,
                 "dollar_adv20": dollar_adv20,
                 "illiquid": illiquid,
-                "candles_debug": cdbg,  # keep debug so you can inspect source used
+                "candles_debug": cdbg,  # keep debug for diagnosis
             }
 
             debug["computed"] += 1
             if len(debug["samples"]) < 6:
-                debug["samples"].append({"instrumentID": iid, "ticker": ticker, "rsi14": rsi14, "above_sma200": above200, "illiquid": illiquid})
+                debug["samples"].append({
+                    "instrumentID": iid,
+                    "ticker": ticker,
+                    "rsi14": rsi14,
+                    "above_sma200": above200,
+                    "illiquid": illiquid
+                })
 
     await asyncio.gather(*(one(i) for i in ids))
     return tech_map, debug
@@ -613,8 +664,7 @@ def build_portfolio_rows(
         iid = int(a["instrumentID"])
         ticker = (ticker_map.get(iid) or str(iid)).strip()
 
-        # Stocks-only view
-        if EXCLUDE_CRYPTO and is_crypto_ticker(ticker):
+        if EXCLUDE_CRYPTO and is_crypto_instrument(iid, ticker):
             continue
 
         initial = normalize_number(a.get("initialAmountInDollars"))
@@ -623,7 +673,13 @@ def build_portfolio_rows(
         weight_pct = (initial / total_initial * 100.0) if (total_initial > 0 and initial and initial > 0) else None
         pnl_pct = (unreal / initial * 100.0) if (initial and initial != 0 and unreal is not None) else None
 
-        tech = tech_map.get(iid, {})
+        tech = tech_map.get(iid)
+        if tech:
+            tag = tech_tags(tech)
+            tech_status = tag if tag else "OK"
+        else:
+            tech_status = "NO_TECH"
+
         rows.append({
             "ticker": ticker,
             "instrumentID": str(iid),
@@ -631,8 +687,8 @@ def build_portfolio_rows(
             "weight_pct": f"{weight_pct:.2f}" if weight_pct is not None else "",
             "pnl_pct": f"{pnl_pct:.2f}" if pnl_pct is not None else "",
             "thesis_score": "",
-            "tech_status": tech_tags(tech) if tech else "",
-            "tech": tech,
+            "tech_status": tech_status,
+            "tech": tech or {},
         })
 
     return rows
@@ -717,7 +773,7 @@ async def dashboard():
         return f"<ul>{lis}</ul>"
 
     rows_html = ""
-    for r in portfolio[:250]:
+    for r in portfolio[:300]:
         rows_html += (
             "<tr>"
             f"<td>{r.get('ticker','')}</td>"
@@ -748,6 +804,7 @@ async def dashboard():
         <h1>My AI Investing Agent</h1>
         <p><b>Last update:</b> {last_update}</p>
         <p><b>Universe:</b> {"Stocks only (crypto excluded)" if EXCLUDE_CRYPTO else "Mixed (crypto allowed)"}</p>
+        <p><b>Crypto filter:</b> instrumentId >= {CRYPTO_ID_MIN} OR ticker in denylist</p>
         <p><b>eToro:</b> Lots = {stats.get("lots_count","")} | Unique instruments = {stats.get("unique_instruments_count","")}</p>
         <p><b>Mapping cache:</b> {mapping.get("cached","")}/{mapping.get("total","")} cached (real tickers)</p>
         <p><b>Technicals:</b> computed {tech_debug.get("computed","")}/{max(0, int(tech_debug.get("requested",0) or 0) - int(tech_debug.get("skipped",0) or 0))} (failed {tech_debug.get("failed","")}, skipped {tech_debug.get("skipped",0)})</p>
@@ -783,7 +840,7 @@ async def dashboard():
           </tbody>
         </table>
 
-        <p>API: <code>/api/portfolio</code> • <code>/api/daily-brief</code> • Debug: <code>/debug/mapping-last</code> • <code>/debug/tech-last</code> • <code>/debug/candles?ticker=CCJ</code></p>
+        <p>API: <code>/api/portfolio</code> • <code>/api/daily-brief</code> • Debug: <code>/debug/mapping-last</code> • <code>/debug/tech-last</code> • <code>/debug/candles?ticker=CCJ</code> • <code>/debug/etoro-candles?instrument_id=10721</code></p>
       </body>
     </html>
     """
@@ -814,21 +871,20 @@ async def run_daily():
     instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
 
     # 1) Mapping
-    ticker_cache, map_dbg = await map_instrument_ids_to_tickers_search(instrument_ids, state)
+    ticker_cache, _map_dbg = await map_instrument_ids_to_tickers_search(instrument_ids, state)
     mapping = state.get("mapping") or {"cached": 0, "total": len(instrument_ids)}
     material_events.append(f"Resolved tickers: {mapping.get('cached',0)}/{mapping.get('total',len(instrument_ids))} (see /debug/mapping-last)")
 
-    # 2) Tech
+    # 2) Technicals
     tech_map, tech_dbg = await compute_technicals_for_ids(instrument_ids, ticker_cache)
     state["tech_debug"] = tech_dbg
 
     if tech_dbg.get("failed", 0) > 0:
         technical_exceptions.append(f"Candles missing for {tech_dbg.get('failed')} instruments (see /debug/tech-last).")
-
     if tech_dbg.get("skipped", 0) > 0:
         material_events.append(f"Skipped {tech_dbg.get('skipped')} instruments (no ticker / crypto excluded).")
 
-    # 3) Portfolio table rows
+    # 3) Portfolio rows
     portfolio_rows = build_portfolio_rows(agg_positions, ticker_cache, tech_map)
 
     # 4) Brief
@@ -841,7 +897,6 @@ async def run_daily():
     tech_den = max(0, int(tech_req) - int(tech_skip))
     await discord_notify(f"✅ Daily done | tickers {mapping.get('cached',0)}/{len(instrument_ids)} | tech {tech_done}/{tech_den}")
 
-    # Save state for dashboard/API
     state.update({
         "date": utc_now_iso(),
         "material_events": material_events,
@@ -908,9 +963,6 @@ async def debug_tech_last():
 async def debug_candles(
     ticker: str = Query(..., description="Try: CCJ, ASML, CEG, ALB, STEM, RKLB"),
 ):
-    if EXCLUDE_CRYPTO and is_crypto_ticker(ticker):
-        return JSONResponse({"ticker": ticker, "status": "skipped_crypto"})
-
     candles, dbg = await stooq_get_daily_candles(ticker, count=180)
     sample = candles[-3:] if candles else []
     return JSONResponse({"ticker": ticker, "debug": dbg, "rows": len(candles), "sample": sample})
@@ -923,26 +975,6 @@ async def debug_etoro_candles(
     candles, dbg = await etoro_get_daily_candles(instrument_id, count=260)
     sample = candles[-3:] if candles else []
     return JSONResponse({"instrumentId": instrument_id, "debug": dbg, "rows": len(candles), "sample": sample})
-
-
-@app.get("/debug/search-test")
-async def debug_search_test(
-    instrument_id: int = Query(..., description="numeric instrumentID from your table"),
-):
-    patterns = [
-        {"instrumentId": str(instrument_id), "pageSize": "5", "pageNumber": "1"},
-        {"internalInstrumentId": str(instrument_id), "pageSize": "5", "pageNumber": "1"},
-        {"q": str(instrument_id), "pageSize": "5", "pageNumber": "1"},
-    ]
-    results = []
-    for params in patterns:
-        status, data = await etoro_search(params)
-        results.append({"params": params, "status": status, "preview": str(data)[:800]})
-    return JSONResponse({
-        "instrumentId": instrument_id,
-        "keys_present": {"ETORO_API_KEY": bool(ETORO_API_KEY), "ETORO_USER_KEY": bool(ETORO_USER_KEY)},
-        "results": results,
-    })
 
 
 @app.post("/admin/seed-mapping")
