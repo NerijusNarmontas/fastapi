@@ -1,9 +1,19 @@
 # main.py
-# Silent agent runner:
-# - Loads portfolio symbols (hardcoded or via holdings.json)
-# - Fetches: news (Google News RSS) + filings (SEC EDGAR, US only)
-# - Computes: energy thesis assessment (rule-based scoring)
-# - Outputs: one JSON file (no essays on screen). Prints nothing unless ERROR.
+# Investing agent core (silent by default).
+# - Works both as:
+#   1) CLI one-shot: `python main.py`  -> writes agent_output.json, prints nothing unless fatal
+#   2) Importable module: app.py can call run_agent() under Hypercorn/ASGI
+#
+# What it does:
+# - Loads symbols from holdings.json (or SYMBOLS env var)
+# - Loads optional per-symbol facts from facts.json (for thesis scoring)
+# - Fetches news via Google News RSS (no API key)
+# - Fetches filings via SEC EDGAR for US-listed tickers (no API key, but needs SEC_USER_AGENT)
+# - Scores each symbol vs your energy thesis (rule-based)
+# - Writes a single output JSON file (OUTPUT_PATH, default agent_output.json)
+#
+# NOTE: If you deploy as a WEB service with Hypercorn, you must provide an ASGI `app` in app.py
+# (Hypercorn expects `module:app`). This file intentionally does NOT define an ASGI app.
 
 from __future__ import annotations
 
@@ -28,7 +38,7 @@ class FetchResult:
     symbol: str
     provider: str
     kind: str                 # "news" or "filings"
-    status: str               # ok|empty|auth_missing|forbidden|rate_limited|timeout|parse_error|not_supported|error
+    status: str               # ok|empty|not_supported|forbidden|rate_limited|timeout|parse_error|error
     http_code: Optional[int] = None
     elapsed_ms: Optional[int] = None
     items: int = 0
@@ -49,11 +59,17 @@ class Timer:
 
 def safe_err(e: Exception) -> str:
     s = "".join(traceback.format_exception_only(type(e), e)).strip()
-    return s[:500]
+    return s[:600]
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def ensure_dir_for_file(path: str) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
 
 
 # ----------------------------
@@ -86,7 +102,6 @@ def fetch_news_google_rss(
 
     feed = feedparser.parse(r.text)
     out: List[Dict[str, Any]] = []
-
     for e in feed.entries[: max_items * 3]:
         title = getattr(e, "title", None)
         link = getattr(e, "link", None)
@@ -130,6 +145,9 @@ def sec_headers(user_agent: str) -> Dict[str, str]:
 
 
 def load_sec_cik_map(user_agent: str, timeout: int = 15) -> Tuple[Optional[int], Dict[str, str]]:
+    """
+    Returns (http_status, map[ticker]=10-digit CIK string)
+    """
     r = requests.get(SEC_TICKER_CIK_URL, headers=sec_headers(user_agent), timeout=timeout)
     if r.status_code != 200:
         return r.status_code, {}
@@ -204,12 +222,13 @@ def fetch_latest_filings_sec(
 
 
 # ----------------------------
-# Thesis scoring (rule-based; no screen text)
+# Energy thesis scoring (rule-based, no narrative output)
 # ----------------------------
 
-DEFAULT_THESIS_RULES = {
+DEFAULT_THESIS_RULES: Dict[str, Any] = {
     "version": "energy_thesis_v1",
     "hard_excludes": {
+        # You explicitly removed refining / downstream.
         "industries": ["Oil & Gas Refining & Marketing", "Refining"],
         "tags": ["DOWNSTREAM_HEAVY", "REFINING"],
     },
@@ -237,25 +256,28 @@ def load_rules(path: str = "thesis_rules.json") -> Dict[str, Any]:
 
 def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
     """
-    facts = structured fields (best effort).
-    Required-ish keys (if missing, scorer uses neutral defaults):
-      - industry (str)
-      - tags (list[str]) e.g. UPSTREAM, MIDSTREAM, URANIUM, NUCLEAR, REFINING
-      - geo (str) e.g. US, CANADA, EU, OTHER
-      - revenue_mix_gas_pct (0..1)
-      - net_debt_to_ebitda (float)
-      - shareholder_yield (float)  # dividend+buyback / market cap, 0..1
-      - capex_growth_pct (float)   # <=0 good, high positive bad
+    facts is optional structured metadata you maintain in facts.json.
+    Missing fields are handled with neutral defaults.
+
+    Suggested keys in facts.json:
+      - company_name: str
+      - industry: str
+      - tags: list[str] e.g. ["UPSTREAM","MIDSTREAM","URANIUM","NUCLEAR"]
+      - geo: str e.g. "US","CANADA"
+      - revenue_mix_gas_pct: float 0..1
+      - net_debt_to_ebitda: float
+      - shareholder_yield: float 0..1
+      - capex_growth_pct: float (<=0 good)
     """
     industry = (facts.get("industry") or "").strip()
     tags = set([str(x).upper() for x in (facts.get("tags") or [])])
     geo = (facts.get("geo") or "OTHER").upper()
 
     exclude_reasons: List[str] = []
-    for bad_ind in rules["hard_excludes"].get("industries", []):
+    for bad_ind in rules.get("hard_excludes", {}).get("industries", []):
         if bad_ind.lower() in industry.lower():
             exclude_reasons.append(f"industry:{bad_ind}")
-    for bad_tag in rules["hard_excludes"].get("tags", []):
+    for bad_tag in rules.get("hard_excludes", {}).get("tags", []):
         if bad_tag.upper() in tags:
             exclude_reasons.append(f"tag:{bad_tag.upper()}")
 
@@ -274,7 +296,7 @@ def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any
     pillar: Dict[str, int] = {}
     flags: List[str] = []
 
-    # Segment fit: upstream/midstream/nuclear/uranium are "in-thesis"
+    # Segment fit: upstream/midstream/nuclear/uranium align with your thesis
     segment_fit = 0.0
     if "UPSTREAM" in tags:
         segment_fit = max(segment_fit, 1.0)
@@ -297,8 +319,8 @@ def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any
     if capex_growth is None:
         capex_score = 0.5
     else:
-        # <=0 good; 50%+ growth -> 0
-        capex_score = 1.0 if capex_growth <= 0.0 else clamp(1.0 - (float(capex_growth) / 0.5), 0, 1)
+        capex_growth = float(capex_growth)
+        capex_score = 1.0 if capex_growth <= 0.0 else clamp(1.0 - (capex_growth / 0.5), 0, 1)
     pillar["capital_discipline"] = int(round(w["capital_discipline"] * capex_score))
 
     # Balance sheet (net debt / EBITDA)
@@ -319,7 +341,7 @@ def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any
         cr_score = 1.0 if sh_yield >= t["shareholder_yield_good"] else clamp(sh_yield / t["shareholder_yield_good"], 0, 1)
     pillar["cash_return"] = int(round(w["cash_return"] * cr_score))
 
-    # Geo relevance (simple; tweak later)
+    # Geo relevance (basic proxy)
     geo_score = 1.0 if geo in {"US", "CANADA"} else 0.7
     pillar["geo_relevance"] = int(round(w["geo_relevance"] * geo_score))
 
@@ -335,17 +357,38 @@ def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any
 
 
 # ----------------------------
-# Facts layer (you can replace with real fundamentals later)
+# Inputs: symbols + optional facts
 # ----------------------------
+
+def load_symbols() -> List[str]:
+    """
+    Priority:
+      1) holdings.json -> {"symbols":[...]}
+      2) env SYMBOLS="EQT,DVN,EPD"
+      3) fallback sample
+    """
+    if os.path.exists("holdings.json"):
+        with open("holdings.json", "r", encoding="utf-8") as f:
+            j = json.load(f)
+        syms = j.get("symbols") or []
+        return [str(s).upper().strip() for s in syms if str(s).strip()]
+
+    env_syms = os.getenv("SYMBOLS", "").strip()
+    if env_syms:
+        return [s.strip().upper() for s in env_syms.split(",") if s.strip()]
+
+    return ["EQT", "DVN", "EPD", "CCJ", "LEU", "SMR", "OKLO"]
+
 
 def load_facts(path: str = "facts.json") -> Dict[str, Dict[str, Any]]:
     """
-    Optional file you maintain/update:
+    Optional file you maintain:
       {
-        "EQT": {"industry":"Oil & Gas E&P", "tags":["UPSTREAM"], "geo":"US", "revenue_mix_gas_pct":0.9, ...},
-        "EPD": {"industry":"Midstream", "tags":["MIDSTREAM"], "geo":"US", ...}
+        "EQT": {"company_name":"EQT", "industry":"Oil & Gas E&P", "tags":["UPSTREAM"], "geo":"US",
+                "revenue_mix_gas_pct":0.9, "net_debt_to_ebitda":1.2, "shareholder_yield":0.06,
+                "capex_growth_pct":-0.05},
+        "EPD": {"company_name":"Enterprise Products", "industry":"Midstream", "tags":["MIDSTREAM"], "geo":"US"}
       }
-    If missing, returns empty dict and scorer uses neutral defaults.
     """
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -353,28 +396,8 @@ def load_facts(path: str = "facts.json") -> Dict[str, Dict[str, Any]]:
     return {}
 
 
-def load_symbols() -> List[str]:
-    """
-    Option A: holdings.json with {"symbols":["EQT","DVN",...]}
-    Option B: set env SYMBOLS="EQT,DVN,EPD"
-    Option C: fallback hardcoded sample list.
-    """
-    if os.path.exists("holdings.json"):
-        with open("holdings.json", "r", encoding="utf-8") as f:
-            j = json.load(f)
-            syms = j.get("symbols") or []
-            return [str(x).upper().strip() for x in syms if str(x).strip()]
-
-    env_syms = os.getenv("SYMBOLS", "").strip()
-    if env_syms:
-        return [s.strip().upper() for s in env_syms.split(",") if s.strip()]
-
-    # Fallback sample
-    return ["EQT", "DVN", "EPD", "CCJ", "LEU", "SMR", "OKLO"]
-
-
 # ----------------------------
-# Runner (silent)
+# Main agent runner (silent)
 # ----------------------------
 
 def run_agent() -> Dict[str, Any]:
@@ -382,35 +405,46 @@ def run_agent() -> Dict[str, Any]:
     facts_db = load_facts()
     rules = load_rules("thesis_rules.json")
 
-    # Optional: improves news queries (you can put this in facts.json too)
-    company_names = {sym: (facts_db.get(sym, {}).get("company_name")) for sym in symbols}
-    company_names = {k: v for k, v in company_names.items() if v}
-
+    # SEC UA (IMPORTANT)
     sec_user_agent = os.getenv("SEC_USER_AGENT", "").strip()
     if not sec_user_agent:
-        sec_user_agent = "MyStockAgent (set SEC_USER_AGENT env var)"  # may get blocked by SEC
+        # This may cause SEC 403; set SEC_USER_AGENT in your environment for reliability.
+        sec_user_agent = "MyStockAgent (set SEC_USER_AGENT env var)"
+
+    # Optional output path
+    out_path = os.getenv("OUTPUT_PATH", "agent_output.json")
+    ensure_dir_for_file(out_path)
 
     telemetry: List[Dict[str, Any]] = []
+    results: Dict[str, Any] = {}
 
+    # Load SEC CIK map once
     cik_status, cik_map = load_sec_cik_map(sec_user_agent)
     if cik_status != 200:
         cik_map = {}
 
+    # Counters
     news_requested = len(symbols)
     filings_requested = len(symbols)
     news_fetched = 0
     filings_fetched = 0
 
-    results: Dict[str, Any] = {}
+    # Build company name map for cleaner news queries
+    company_names: Dict[str, str] = {}
+    for sym in symbols:
+        cn = facts_db.get(sym, {}).get("company_name")
+        if isinstance(cn, str) and cn.strip():
+            company_names[sym] = cn.strip()
 
+    # Loop
     for sym in symbols:
         results[sym] = {"symbol": sym}
 
-        # --- Thesis scoring (always runs)
+        # Thesis scoring (always)
         facts = facts_db.get(sym, {})
         results[sym]["thesis"] = score_energy_thesis(sym, facts, rules)
 
-        # --- News
+        # News
         with Timer() as t:
             try:
                 http_code, items = fetch_news_google_rss(sym, company_name=company_names.get(sym))
@@ -420,14 +454,14 @@ def run_agent() -> Dict[str, Any]:
                 telemetry.append(
                     FetchResult(sym, "google_rss", "news", status, http_code, t.elapsed_ms, len(items)).to_dict()
                 )
-                results[sym]["news"] = items  # remove if you want ultra-compact output
+                results[sym]["news"] = items
             except Exception as e:
                 telemetry.append(
                     FetchResult(sym, "google_rss", "news", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict()
                 )
                 results[sym]["news"] = []
 
-        # --- Filings
+        # Filings (rate-limit a bit to avoid SEC 429)
         with Timer() as t:
             try:
                 http_code, items = fetch_latest_filings_sec(sym, cik_map, sec_user_agent)
@@ -440,12 +474,14 @@ def run_agent() -> Dict[str, Any]:
                 telemetry.append(
                     FetchResult(sym, "sec_edgar", "filings", status, http_code, t.elapsed_ms, len(items)).to_dict()
                 )
-                results[sym]["filings"] = items  # remove if you want ultra-compact output
+                results[sym]["filings"] = items
             except Exception as e:
                 telemetry.append(
                     FetchResult(sym, "sec_edgar", "filings", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict()
                 )
                 results[sym]["filings"] = []
+
+        time.sleep(0.35)
 
     status_obj: Dict[str, Any] = {
         "status": "ok",
@@ -459,19 +495,18 @@ def run_agent() -> Dict[str, Any]:
         "results": results,
     }
 
-    # Fail loudly if you requested news and got literally zero
+    # Do NOT hard-fail on zero news (network blocks happen). Just warn.
     if news_requested > 0 and news_fetched == 0:
-        status_obj["status"] = "error"
-        status_obj["error"] = "News fetch returned zero across all symbols. Check telemetry (http_code/status/error)."
-
-    # Filings can be legitimately zero if most symbols are non-US; still warn
-    if filings_requested > 0 and filings_fetched == 0:
         status_obj.setdefault("warnings", []).append(
-            "Filings fetched zero across all symbols. Could be non-US holdings or SEC blocked. Check telemetry and SEC_USER_AGENT."
+            "News fetched zero across all symbols (Google RSS blocked or network issue). Check telemetry."
         )
 
-    # Write output silently
-    out_path = os.getenv("OUTPUT_PATH", "agent_output.json")
+    if filings_requested > 0 and filings_fetched == 0:
+        status_obj.setdefault("warnings", []).append(
+            "Filings fetched zero across all symbols (non-US symbols or SEC blocked). Check telemetry + SEC_USER_AGENT."
+        )
+
+    # Write output (silent)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(status_obj, f, ensure_ascii=False, indent=2)
 
@@ -479,8 +514,11 @@ def run_agent() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # Silent by default: no prints.
-    # If something goes wrong, raise so your runner/CI sees it.
-    obj = run_agent()
-    if obj.get("status") == "error":
-        raise SystemExit(obj.get("error", "Agent failed"))
+    # Silent: no prints. If a fatal exception happens before output write, create crash.log.
+    try:
+        run_agent()
+    except Exception:
+        with open("crash.log", "w", encoding="utf-8") as f:
+            f.write("FATAL ERROR\n")
+            f.write("".join(traceback.format_exc()))
+        raise SystemExit(1)
