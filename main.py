@@ -3,17 +3,6 @@
 # - Works both as:
 #   1) CLI one-shot: `python main.py`  -> writes agent_output.json, prints nothing unless fatal
 #   2) Importable module: app.py can call run_agent() under Hypercorn/ASGI
-#
-# What it does:
-# - Loads symbols from holdings.json (or SYMBOLS env var)
-# - Loads optional per-symbol facts from facts.json (for thesis scoring)
-# - Fetches news via Google News RSS (no API key)
-# - Fetches filings via SEC EDGAR for US-listed tickers (no API key, but needs SEC_USER_AGENT)
-# - Scores each symbol vs your energy thesis (rule-based)
-# - Writes a single output JSON file (OUTPUT_PATH, default agent_output.json)
-#
-# NOTE: If you deploy as a WEB service with Hypercorn, you must provide an ASGI `app` in app.py
-# (Hypercorn expects `module:app`). This file intentionally does NOT define an ASGI app.
 
 from __future__ import annotations
 
@@ -228,12 +217,11 @@ def fetch_latest_filings_sec(
 DEFAULT_THESIS_RULES: Dict[str, Any] = {
     "version": "energy_thesis_v1",
     "hard_excludes": {
-        # You explicitly removed refining / downstream.
         "industries": ["Oil & Gas Refining & Marketing", "Refining"],
         "tags": ["DOWNSTREAM_HEAVY", "REFINING"],
     },
     "weights": {
-        "segment_fit": 25,         # upstream/midstream/nuclear alignment
+        "segment_fit": 25,
         "gas_leverage": 20,
         "capital_discipline": 20,
         "balance_sheet": 15,
@@ -255,20 +243,6 @@ def load_rules(path: str = "thesis_rules.json") -> Dict[str, Any]:
 
 
 def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    facts is optional structured metadata you maintain in facts.json.
-    Missing fields are handled with neutral defaults.
-
-    Suggested keys in facts.json:
-      - company_name: str
-      - industry: str
-      - tags: list[str] e.g. ["UPSTREAM","MIDSTREAM","URANIUM","NUCLEAR"]
-      - geo: str e.g. "US","CANADA"
-      - revenue_mix_gas_pct: float 0..1
-      - net_debt_to_ebitda: float
-      - shareholder_yield: float 0..1
-      - capex_growth_pct: float (<=0 good)
-    """
     industry = (facts.get("industry") or "").strip()
     tags = set([str(x).upper() for x in (facts.get("tags") or [])])
     geo = (facts.get("geo") or "OTHER").upper()
@@ -296,7 +270,6 @@ def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any
     pillar: Dict[str, int] = {}
     flags: List[str] = []
 
-    # Segment fit: upstream/midstream/nuclear/uranium align with your thesis
     segment_fit = 0.0
     if "UPSTREAM" in tags:
         segment_fit = max(segment_fit, 1.0)
@@ -305,16 +278,13 @@ def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any
     if "NUCLEAR" in tags or "URANIUM" in tags:
         segment_fit = max(segment_fit, 1.0)
         flags.append("NUCLEAR_BUCKET")
-
     pillar["segment_fit"] = int(round(w["segment_fit"] * clamp(segment_fit, 0, 1)))
 
-    # Gas leverage
     gas_pct = float(facts.get("revenue_mix_gas_pct") or 0.0)
     if gas_pct >= 0.5:
         flags.append("US_GAS_LEVERAGE" if geo == "US" else "GAS_LEVERAGE")
     pillar["gas_leverage"] = int(round(w["gas_leverage"] * clamp(gas_pct, 0, 1)))
 
-    # Capital discipline proxy (capex growth)
     capex_growth = facts.get("capex_growth_pct")
     if capex_growth is None:
         capex_score = 0.5
@@ -323,7 +293,6 @@ def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any
         capex_score = 1.0 if capex_growth <= 0.0 else clamp(1.0 - (capex_growth / 0.5), 0, 1)
     pillar["capital_discipline"] = int(round(w["capital_discipline"] * capex_score))
 
-    # Balance sheet (net debt / EBITDA)
     nde = facts.get("net_debt_to_ebitda")
     if nde is None:
         bs_score = 0.5
@@ -332,7 +301,6 @@ def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any
         bs_score = 1.0 if nde <= t["net_debt_to_ebitda_good"] else clamp(t["net_debt_to_ebitda_good"] / nde, 0, 1)
     pillar["balance_sheet"] = int(round(w["balance_sheet"] * bs_score))
 
-    # Cash return (shareholder yield)
     sh_yield = facts.get("shareholder_yield")
     if sh_yield is None:
         cr_score = 0.4
@@ -341,7 +309,6 @@ def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any
         cr_score = 1.0 if sh_yield >= t["shareholder_yield_good"] else clamp(sh_yield / t["shareholder_yield_good"], 0, 1)
     pillar["cash_return"] = int(round(w["cash_return"] * cr_score))
 
-    # Geo relevance (basic proxy)
     geo_score = 1.0 if geo in {"US", "CANADA"} else 0.7
     pillar["geo_relevance"] = int(round(w["geo_relevance"] * geo_score))
 
@@ -361,12 +328,6 @@ def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any
 # ----------------------------
 
 def load_symbols() -> List[str]:
-    """
-    Priority:
-      1) holdings.json -> {"symbols":[...]}
-      2) env SYMBOLS="EQT,DVN,EPD"
-      3) fallback sample
-    """
     if os.path.exists("holdings.json"):
         with open("holdings.json", "r", encoding="utf-8") as f:
             j = json.load(f)
@@ -381,15 +342,6 @@ def load_symbols() -> List[str]:
 
 
 def load_facts(path: str = "facts.json") -> Dict[str, Dict[str, Any]]:
-    """
-    Optional file you maintain:
-      {
-        "EQT": {"company_name":"EQT", "industry":"Oil & Gas E&P", "tags":["UPSTREAM"], "geo":"US",
-                "revenue_mix_gas_pct":0.9, "net_debt_to_ebitda":1.2, "shareholder_yield":0.06,
-                "capex_growth_pct":-0.05},
-        "EPD": {"company_name":"Enterprise Products", "industry":"Midstream", "tags":["MIDSTREAM"], "geo":"US"}
-      }
-    """
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -405,63 +357,49 @@ def run_agent() -> Dict[str, Any]:
     facts_db = load_facts()
     rules = load_rules("thesis_rules.json")
 
-    # SEC UA (IMPORTANT)
     sec_user_agent = os.getenv("SEC_USER_AGENT", "").strip()
     if not sec_user_agent:
-        # This may cause SEC 403; set SEC_USER_AGENT in your environment for reliability.
         sec_user_agent = "MyStockAgent (set SEC_USER_AGENT env var)"
 
-    # Optional output path
     out_path = os.getenv("OUTPUT_PATH", "agent_output.json")
     ensure_dir_for_file(out_path)
 
     telemetry: List[Dict[str, Any]] = []
     results: Dict[str, Any] = {}
 
-    # Load SEC CIK map once
     cik_status, cik_map = load_sec_cik_map(sec_user_agent)
     if cik_status != 200:
         cik_map = {}
 
-    # Counters
     news_requested = len(symbols)
     filings_requested = len(symbols)
     news_fetched = 0
     filings_fetched = 0
 
-    # Build company name map for cleaner news queries
     company_names: Dict[str, str] = {}
     for sym in symbols:
         cn = facts_db.get(sym, {}).get("company_name")
         if isinstance(cn, str) and cn.strip():
             company_names[sym] = cn.strip()
 
-    # Loop
     for sym in symbols:
         results[sym] = {"symbol": sym}
 
-        # Thesis scoring (always)
         facts = facts_db.get(sym, {})
         results[sym]["thesis"] = score_energy_thesis(sym, facts, rules)
 
-        # News
         with Timer() as t:
             try:
                 http_code, items = fetch_news_google_rss(sym, company_name=company_names.get(sym))
                 status = "ok" if items else "empty"
                 if items:
                     news_fetched += 1
-                telemetry.append(
-                    FetchResult(sym, "google_rss", "news", status, http_code, t.elapsed_ms, len(items)).to_dict()
-                )
+                telemetry.append(FetchResult(sym, "google_rss", "news", status, http_code, t.elapsed_ms, len(items)).to_dict())
                 results[sym]["news"] = items
             except Exception as e:
-                telemetry.append(
-                    FetchResult(sym, "google_rss", "news", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict()
-                )
+                telemetry.append(FetchResult(sym, "google_rss", "news", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict())
                 results[sym]["news"] = []
 
-        # Filings (rate-limit a bit to avoid SEC 429)
         with Timer() as t:
             try:
                 http_code, items = fetch_latest_filings_sec(sym, cik_map, sec_user_agent)
@@ -471,14 +409,10 @@ def run_agent() -> Dict[str, Any]:
                     status = "ok" if items else "empty"
                 if items:
                     filings_fetched += 1
-                telemetry.append(
-                    FetchResult(sym, "sec_edgar", "filings", status, http_code, t.elapsed_ms, len(items)).to_dict()
-                )
+                telemetry.append(FetchResult(sym, "sec_edgar", "filings", status, http_code, t.elapsed_ms, len(items)).to_dict())
                 results[sym]["filings"] = items
             except Exception as e:
-                telemetry.append(
-                    FetchResult(sym, "sec_edgar", "filings", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict()
-                )
+                telemetry.append(FetchResult(sym, "sec_edgar", "filings", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict())
                 results[sym]["filings"] = []
 
         time.sleep(0.35)
@@ -495,7 +429,6 @@ def run_agent() -> Dict[str, Any]:
         "results": results,
     }
 
-    # Do NOT hard-fail on zero news (network blocks happen). Just warn.
     if news_requested > 0 and news_fetched == 0:
         status_obj.setdefault("warnings", []).append(
             "News fetched zero across all symbols (Google RSS blocked or network issue). Check telemetry."
@@ -506,7 +439,6 @@ def run_agent() -> Dict[str, Any]:
             "Filings fetched zero across all symbols (non-US symbols or SEC blocked). Check telemetry + SEC_USER_AGENT."
         )
 
-    # Write output (silent)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(status_obj, f, ensure_ascii=False, indent=2)
 
@@ -514,7 +446,6 @@ def run_agent() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # Silent: no prints. If a fatal exception happens before output write, create crash.log.
     try:
         run_agent()
     except Exception:
