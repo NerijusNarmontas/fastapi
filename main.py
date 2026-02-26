@@ -13,37 +13,27 @@ from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 # ============================================================
-# GOALS (your requirements)
-# 1) Stocks-only view (crypto excluded)
-# 2) Crypto tickers like W (Wormhole) must be removed even if the symbol collides with a stock
-# 3) Technicals computed reliably:
-#    - Primary candles: Stooq (free)
-#    - Fallback candles: eToro (by instrumentId) with rate-limit backoff (fixes 429)
-# 4) Keep "empty Tech" understandable (OK / NO_TECH)
-# 5) Organize stocks by buckets: Energy (Oil/Gas + Midstream), Nuclear/Uranium, Tech/Semi/DC, Quantum, etc
-# 6) Add 7 key fundamentals for decision-making (with cache + optional provider)
-# 7) Include your Energy thesis and a thesis-fit score for Energy names
+# GOALS
+# - Stocks-only view (crypto excluded)
+# - Crypto tickers like W (Wormhole) removed even if symbol collides with stock
+# - Technicals: Stooq primary, eToro fallback with 429 backoff
+# - Organized buckets: Energy (Oil/Gas + Midstream), Nuclear/Uranium, Tech, Quantum, etc
+# - 7 key fundamentals + Energy thesis-fit score (Energy only)
+# - Robust fundamentals: symbol normalization + error handling + debug endpoints
 # ============================================================
 
-# ----------------------------
-# ENV VARS (Railway)
-# ----------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
 ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()
 ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip()
 
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()  # optional
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()                  # optional
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
-# Optional fundamentals provider: Financial Modeling Prep (recommended)
-# If missing => fundamentals will show NO_FUND, but app still works.
+# Fundamentals provider: Financial Modeling Prep (optional but recommended)
 FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
 
-# Universe controls
 EXCLUDE_CRYPTO = os.getenv("EXCLUDE_CRYPTO", "true").strip().lower() in ("1", "true", "yes", "y")
 
-# Crypto denylist
 CRYPTO_DENY = {
     x.strip().upper()
     for x in os.getenv(
@@ -56,45 +46,31 @@ CRYPTO_ID_MIN = int(os.getenv("CRYPTO_ID_MIN", "100000"))
 
 STATE_PATH = "/tmp/investing_agent_state.json"
 
-# ----------------------------
-# eToro endpoints
-# ----------------------------
 ETORO_REAL_PNL_URL = "https://public-api.etoro.com/api/v1/trading/info/real/pnl"
 ETORO_SEARCH_URL = "https://public-api.etoro.com/api/v1/market-data/search"
-ETORO_CANDLES_URL_TMPL = "https://public-api.etoro.com/api/v1/market-data/instruments/{instrumentId}/history/candles/asc/OneDay/{count}"
+ETORO_CANDLES_URL_TMPL = (
+    "https://public-api.etoro.com/api/v1/market-data/instruments/{instrumentId}/history/candles/asc/OneDay/{count}"
+)
 
-# ----------------------------
-# Fundamentals endpoints (FMP)
-# ----------------------------
 FMP_BASE = "https://financialmodelingprep.com/api/v3"
 FMP_QUOTE = f"{FMP_BASE}/quote/{{symbol}}"
-FMP_PROFILE = f"{FMP_BASE}/profile/{{symbol}}"
 FMP_KEY_METRICS_TTM = f"{FMP_BASE}/key-metrics-ttm/{{symbol}}"
 FMP_RATIOS_TTM = f"{FMP_BASE}/ratios-ttm/{{symbol}}"
 
-# ============================================================
-# GLOBALS: shared HTTP + locks
-# ============================================================
 http_client: Optional[httpx.AsyncClient] = None
 _STATE_LOCK = asyncio.Lock()
 _DAILY_LOCK = asyncio.Lock()
-
 _ETORO_FALLBACK_SEM = asyncio.Semaphore(int(os.getenv("ETORO_FALLBACK_CONCURRENCY", "2")))
-
-# Gentle concurrency for fundamentals
 _FUND_SEM = asyncio.Semaphore(int(os.getenv("FUND_CONCURRENCY", "4")))
 
-# ============================================================
-# APP (lifespan creates one shared AsyncClient)
-# ============================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(30.0, connect=10.0),
-        limits=httpx.Limits(max_connections=70, max_keepalive_connections=25),
-        headers={"user-agent": "fastapi-investing-agent/1.1"},
+        limits=httpx.Limits(max_connections=80, max_keepalive_connections=30),
+        headers={"user-agent": "fastapi-investing-agent/1.2"},
     )
     yield
     await http_client.aclose()
@@ -103,15 +79,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="My AI Investing Agent", lifespan=lifespan)
 
-# ============================================================
-# ERRORS: global handler so crashes are visible in logs
-# ============================================================
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     print("UNHANDLED EXCEPTION:\n", tb)
     return PlainTextResponse("Internal server error", status_code=500)
+
 
 # ============================================================
 # STATE
@@ -153,6 +127,7 @@ def require_admin(request: Request) -> None:
         if token != ADMIN_TOKEN:
             raise HTTPException(status_code=401, detail="Missing/invalid x-admin-token")
 
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -182,10 +157,6 @@ def safe_float(x: Any) -> Optional[float]:
         return None
 
 
-def normalize_number(x: Any) -> Optional[float]:
-    return safe_float(x)
-
-
 def looks_like_numeric_id(s: str) -> bool:
     return (s or "").strip().isdigit()
 
@@ -194,14 +165,11 @@ def fmt(x: Any, nd: int = 2) -> str:
     v = safe_float(x)
     if v is None:
         return ""
-    try:
-        return f"{v:.{nd}f}"
-    except Exception:
-        return str(v)
+    return f"{v:.{nd}f}"
 
 
-def fmt_pct(x: Any, nd: int = 2) -> str:
-    v = safe_float(x)
+def fmt_pct(frac: Any, nd: int = 2) -> str:
+    v = safe_float(frac)
     if v is None:
         return ""
     return f"{v*100:.{nd}f}%"
@@ -252,11 +220,11 @@ def pick_instrument_id(p: Dict[str, Any]) -> Optional[int]:
 
 
 def pick_unrealized_pnl(p: Dict[str, Any]) -> Optional[float]:
-    return normalize_number(p.get("unrealizedPnL") or p.get("unrealizedPnl") or p.get("unrealized_pnl"))
+    return safe_float(p.get("unrealizedPnL") or p.get("unrealizedPnl") or p.get("unrealized_pnl"))
 
 
 def pick_initial_usd(p: Dict[str, Any]) -> Optional[float]:
-    return normalize_number(p.get("initialAmountInDollars") or p.get("initialAmount") or p.get("initial_amount_usd"))
+    return safe_float(p.get("initialAmountInDollars") or p.get("initialAmount") or p.get("initial_amount_usd"))
 
 
 def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -293,32 +261,29 @@ def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tu
     stats = {"lots_count": len(raw_positions), "unique_instruments_count": len(aggregated)}
     return aggregated, stats
 
+
 # ============================================================
-# DEFAULT BUCKETS (you can override via /admin/set-categories)
+# CATEGORIES
 # ============================================================
 
 DEFAULT_CATEGORIES: Dict[str, List[str]] = {
-    "ENERGY_OIL_GAS": [
-        "EOG", "DVN", "SM", "NOG", "FANG", "CIVI", "CTRA", "MTDR", "RRC", "GPOR",
-        "VIST", "OXY", "TALO", "WDS", "VET", "EQT"
-    ],
-    "ENERGY_MIDSTREAM": ["EPD", "WMB", "ET", "WES", "TRGP"],
-    "NUCLEAR_URANIUM": ["CCJ", "LEU", "UEC", "SMR", "OKLO"],
-    "TECH_SEMI_DATACENTER": ["NVDA", "AMD", "AVGO", "ASML", "TSM", "AMAT", "LRCX", "MU", "INTC", "ARM", "MSFT", "AMZN", "GOOGL"],
-    "QUANTUM": ["IONQ", "RGTI", "QBTS", "ARQQ"],
-    "GOLD_PGM_MINERS": ["NEM", "AEM", "GOLD", "KGC", "AU", "RGLD", "SBSW"],
+    "ENERGY_OIL_GAS": ["EOG","DVN","SM","NOG","FANG","CIVI","CTRA","MTDR","RRC","GPOR","VIST","OXY","TALO","WDS","VET","EQT"],
+    "ENERGY_MIDSTREAM": ["EPD","WMB","ET","WES","TRGP"],
+    "NUCLEAR_URANIUM": ["CCJ","LEU","UEC","SMR","OKLO"],
+    "TECH_SEMI_DATACENTER": ["NVDA","AMD","AVGO","ASML","TSM","AMAT","LRCX","MU","INTC","ARM","MSFT","AMZN","GOOGL"],
+    "QUANTUM": ["IONQ","RGTI","QBTS","ARQQ"],
+    "GOLD_PGM_MINERS": ["NEM","AEM","GOLD","KGC","AU","RGLD","SBSW"],
     "OTHER": [],
 }
+
 
 def get_categories(state: Dict[str, Any]) -> Dict[str, List[str]]:
     raw = state.get("categories")
     if isinstance(raw, dict) and raw:
         out: Dict[str, List[str]] = {}
         for k, v in raw.items():
-            if not isinstance(k, str):
-                continue
-            if isinstance(v, list):
-                out[k] = [str(x).upper().strip() for x in v if str(x).strip()]
+            if isinstance(k, str) and isinstance(v, list):
+                out[k.strip().upper()] = [str(x).upper().strip() for x in v if str(x).strip()]
         return out if out else DEFAULT_CATEGORIES
     return DEFAULT_CATEGORIES
 
@@ -344,40 +309,31 @@ def category_label(cat: str) -> str:
         "OTHER": "Other / Unclassified",
     }.get(cat, cat)
 
+
 # ============================================================
-# ENERGY THESIS (embedded) + thesis-fit score
+# ENERGY THESIS + thesis-fit score
 # ============================================================
 
 ENERGY_THESIS_TEXT = (
-    "Energy Thesis (traditional, disciplined): post-shale peak dynamics; capital discipline; high FCF; "
-    "low leverage; Tier 1 acreage; resilient cash returns; geopolitically relevant assets; "
-    "gas leverage / LNG optionality where appropriate; avoid refiners."
+    "Energy Thesis: post-shale peak dynamics; capital discipline; high FCF; low leverage; "
+    "Tier 1 acreage; resilient cash returns; geopolitically relevant assets; gas leverage / LNG optionality; "
+    "avoid refiners."
 )
 
+
 def energy_thesis_fit(fund: Dict[str, Any]) -> Tuple[Optional[int], List[str]]:
-    """
-    Score 0–100 using fundamentals if available.
-    Uses typical energy decision levers:
-      - FCF yield (big weight)
-      - Net debt / EBITDA (leverage)
-      - ROIC/ROCE
-      - Shareholder yield / dividend yield (proxy)
-      - Valuation sanity (P/E or EV/EBITDA if present)
-    If missing fundamentals => None.
-    """
     if not fund or fund.get("status") != "ok":
         return None, ["NO_FUND"]
 
     tags: List[str] = []
-    score = 50  # start neutral
+    score = 50
 
-    fcf_yield = safe_float(fund.get("fcf_yield"))          # fraction (0.10 => 10%)
-    nde = safe_float(fund.get("net_debt_ebitda"))          # number
-    roic = safe_float(fund.get("roic"))                    # fraction
-    div_y = safe_float(fund.get("dividend_yield"))         # fraction
-    pe = safe_float(fund.get("pe"))                        # number
+    fcf_yield = safe_float(fund.get("fcf_yield"))
+    nde = safe_float(fund.get("net_debt_ebitda"))
+    roic = safe_float(fund.get("roic"))
+    div_y = safe_float(fund.get("dividend_yield"))
+    pe = safe_float(fund.get("pe"))
 
-    # FCF yield
     if fcf_yield is not None:
         if fcf_yield >= 0.12:
             score += 18; tags.append("FCF++")
@@ -390,7 +346,6 @@ def energy_thesis_fit(fund: Dict[str, Any]) -> Tuple[Optional[int], List[str]]:
     else:
         tags.append("FCF?")
 
-    # Leverage
     if nde is not None:
         if nde <= 1.0:
             score += 14; tags.append("LEV++")
@@ -403,7 +358,6 @@ def energy_thesis_fit(fund: Dict[str, Any]) -> Tuple[Optional[int], List[str]]:
     else:
         tags.append("LEV?")
 
-    # ROIC / ROCE proxy
     if roic is not None:
         if roic >= 0.15:
             score += 10; tags.append("ROIC+")
@@ -414,7 +368,6 @@ def energy_thesis_fit(fund: Dict[str, Any]) -> Tuple[Optional[int], List[str]]:
     else:
         tags.append("ROIC?")
 
-    # Shareholder returns proxy
     if div_y is not None:
         if div_y >= 0.04:
             score += 6; tags.append("DIV+")
@@ -423,7 +376,6 @@ def energy_thesis_fit(fund: Dict[str, Any]) -> Tuple[Optional[int], List[str]]:
     else:
         tags.append("DIV?")
 
-    # Valuation sanity check (very rough)
     if pe is not None:
         if pe <= 10:
             score += 4; tags.append("VAL+")
@@ -433,8 +385,9 @@ def energy_thesis_fit(fund: Dict[str, Any]) -> Tuple[Optional[int], List[str]]:
     score = max(0, min(100, int(round(score))))
     return score, tags
 
+
 # ============================================================
-# eTORO HTTP
+# eToro HTTP
 # ============================================================
 
 def etoro_headers() -> Dict[str, str]:
@@ -444,7 +397,7 @@ def etoro_headers() -> Dict[str, str]:
         "x-api-key": ETORO_API_KEY,
         "x-user-key": ETORO_USER_KEY,
         "x-request-id": str(uuid.uuid4()),
-        "user-agent": "fastapi-investing-agent/1.1",
+        "user-agent": "fastapi-investing-agent/1.2",
         "accept": "application/json",
     }
 
@@ -591,8 +544,9 @@ async def etoro_get_daily_candles(instrument_id: int, count: int = 260) -> Tuple
     dbg["status"] = "rate_limited_exhausted" if dbg.get("http") == 429 else dbg["status"]
     return [], dbg
 
+
 # ============================================================
-# STOCK CANDLES (Stooq primary)
+# Stooq candles (primary)
 # ============================================================
 
 async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -605,7 +559,6 @@ async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[D
     if not t:
         dbg["status"] = "empty_ticker"
         return [], dbg
-
     if looks_like_numeric_id(t):
         dbg["status"] = "numeric_not_ticker"
         return [], dbg
@@ -672,8 +625,9 @@ async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[D
     dbg["rows"] = len(candles)
     return candles, dbg
 
+
 # ============================================================
-# TECHNICAL INDICATORS
+# Technical indicators
 # ============================================================
 
 def sma(values: List[float], n: int) -> Optional[float]:
@@ -740,119 +694,11 @@ def tech_tags(t: Dict[str, Any]) -> str:
     if isinstance(mh, (int, float)):
         tags.append("MACD+" if mh >= 0 else "MACD-")
 
-    illq = t.get("illiquid")
-    if illq:
+    if t.get("illiquid"):
         tags.append("ILLQ")
 
     return " | ".join(tags)
 
-# ============================================================
-# FUNDAMENTALS (7 key parameters) with cache + optional provider
-# ============================================================
-
-FUND_KEYS = [
-    "market_cap",        # size / survivability / liquidity
-    "pe",                # valuation sanity
-    "ev_ebitda",          # valuation for capital-intensive names
-    "fcf_yield",          # capital discipline / self-funding
-    "net_debt_ebitda",    # balance-sheet risk
-    "roic",               # quality of business / moat
-    "dividend_yield",     # shareholder return proxy (plus buybacks not always captured)
-]
-
-def fund_status(f: Dict[str, Any]) -> str:
-    return str((f or {}).get("status") or "NO_FUND")
-
-
-async def fmp_get_json(url: str, params: Dict[str, str]) -> Tuple[Optional[Any], Optional[str]]:
-    if http_client is None:
-        return None, "http_client_not_ready"
-    try:
-        r = await http_client.get(url, params=params)
-        if r.status_code == 429:
-            # gentle backoff
-            await asyncio.sleep(2)
-            r = await http_client.get(url, params=params)
-        if r.status_code >= 400:
-            return None, f"http_{r.status_code}"
-        return r.json(), None
-    except Exception as e:
-        return None, repr(e)
-
-
-async def get_fundamentals_symbol(symbol: str, state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Returns normalized fundamentals dict with 7 parameters.
-    Uses state['fund_cache'] with a simple daily TTL.
-    """
-    sym = (symbol or "").upper().strip()
-    if not sym or looks_like_numeric_id(sym):
-        return {"status": "NO_FUND"}
-
-    # cache
-    cache = state.get("fund_cache") if isinstance(state.get("fund_cache"), dict) else {}
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    cached = cache.get(sym)
-    if isinstance(cached, dict) and cached.get("date") == today:
-        return cached
-
-    if not FMP_API_KEY:
-        out = {"status": "NO_FUND", "date": today}
-        cache[sym] = out
-        state["fund_cache"] = cache
-        return out
-
-    async with _FUND_SEM:
-        # Pull a few lightweight endpoints
-        q, qerr = await fmp_get_json(FMP_QUOTE.format(symbol=sym), {"apikey": FMP_API_KEY})
-        km, kmerr = await fmp_get_json(FMP_KEY_METRICS_TTM.format(symbol=sym), {"apikey": FMP_API_KEY})
-        rt, rterr = await fmp_get_json(FMP_RATIOS_TTM.format(symbol=sym), {"apikey": FMP_API_KEY})
-
-    quote0 = q[0] if isinstance(q, list) and q else {}
-    km0 = km[0] if isinstance(km, list) and km else {}
-    rt0 = rt[0] if isinstance(rt, list) and rt else {}
-
-    market_cap = safe_float(quote0.get("marketCap") or quote0.get("mktCap"))
-    pe = safe_float(quote0.get("pe") or quote0.get("peRatio"))
-    ev_ebitda = safe_float(km0.get("enterpriseValueOverEBITDATTM") or rt0.get("enterpriseValueMultipleTTM"))
-    fcf_yield = safe_float(km0.get("freeCashFlowYieldTTM") or rt0.get("freeCashFlowYieldTTM"))
-    net_debt_ebitda = safe_float(km0.get("netDebtToEBITDATTM") or rt0.get("netDebtToEBITDATTM"))
-    roic = safe_float(km0.get("roicTTM") or rt0.get("returnOnCapitalEmployedTTM"))
-    dividend_yield = safe_float(km0.get("dividendYieldTTM") or rt0.get("dividendYieldTTM") or quote0.get("dividendYield"))
-
-    ok = any(v is not None for v in [market_cap, pe, ev_ebitda, fcf_yield, net_debt_ebitda, roic, dividend_yield])
-    out = {
-        "status": "ok" if ok else "NO_FUND",
-        "date": today,
-        "market_cap": market_cap,
-        "pe": pe,
-        "ev_ebitda": ev_ebitda,
-        "fcf_yield": fcf_yield,
-        "net_debt_ebitda": net_debt_ebitda,
-        "roic": roic,
-        "dividend_yield": dividend_yield,
-        "errors": {"quote": qerr, "key_metrics": kmerr, "ratios": rterr},
-    }
-
-    cache[sym] = out
-    state["fund_cache"] = cache
-    return out
-
-
-async def compute_fundamentals_for_symbols(symbols: List[str], state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    syms = sorted(set((s or "").upper().strip() for s in symbols if s and not looks_like_numeric_id(s)))
-    out: Dict[str, Dict[str, Any]] = {}
-
-    async def one(sym: str):
-        out[sym] = await get_fundamentals_symbol(sym, state)
-
-    await asyncio.gather(*(one(s) for s in syms))
-    await save_state(state)
-    return out
-
-# ============================================================
-# TECH PIPELINE
-# ============================================================
 
 async def compute_technicals_for_ids(
     instrument_ids: List[int],
@@ -861,31 +707,18 @@ async def compute_technicals_for_ids(
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
     ids = sorted(set(int(x) for x in instrument_ids if x is not None))
     tech_map: Dict[int, Dict[str, Any]] = {}
-    debug: Dict[str, Any] = {
-        "provider": "stooq+etoro_fallback",
-        "requested": len(ids),
-        "computed": 0,
-        "skipped": 0,
-        "failed": 0,
-        "samples": [],
-    }
+    debug: Dict[str, Any] = {"provider": "stooq+etoro_fallback", "requested": len(ids), "computed": 0, "skipped": 0, "failed": 0, "samples": []}
 
     sem = asyncio.Semaphore(int(os.getenv("TECH_CONCURRENCY", "6")))
 
     async def one(iid: int):
         async with sem:
             ticker = (ticker_map.get(iid) or "").strip()
-
             if not ticker or looks_like_numeric_id(ticker):
                 debug["skipped"] += 1
-                if len(debug["samples"]) < 20:
-                    debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "skipped_no_ticker"})
                 return
-
             if EXCLUDE_CRYPTO and is_crypto_instrument(iid, ticker):
                 debug["skipped"] += 1
-                if len(debug["samples"]) < 20:
-                    debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "skipped_crypto"})
                 return
 
             candles, cdbg = await stooq_get_daily_candles(ticker, count=candles_count)
@@ -893,38 +726,27 @@ async def compute_technicals_for_ids(
             if (not candles) or (len(candles) < 80):
                 async with _ETORO_FALLBACK_SEM:
                     ecandles, edbg = await etoro_get_daily_candles(iid, count=candles_count)
-
                 if ecandles and len(ecandles) >= 80:
                     candles = ecandles
                     cdbg = {"stooq": cdbg, "fallback": edbg}
                 else:
                     debug["failed"] += 1
-                    if len(debug["samples"]) < 20:
-                        debug["samples"].append({
-                            "instrumentID": iid,
-                            "ticker": ticker,
-                            "status": "no_candles",
-                            "cdbg": cdbg,
-                            "fallback": edbg
-                        })
+                    if len(debug["samples"]) < 12:
+                        debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "no_candles", "dbg": cdbg})
                     return
 
-            closes = [normalize_number(c.get("close")) for c in candles]
-            vols = [normalize_number(c.get("volume")) for c in candles]
+            closes = [safe_float(c.get("close")) for c in candles]
+            vols = [safe_float(c.get("volume")) for c in candles]
             closes = [c for c in closes if isinstance(c, (int, float))]
             vols = [v if isinstance(v, (int, float)) else 0.0 for v in vols]
 
             if len(closes) < 80:
                 debug["failed"] += 1
-                if len(debug["samples"]) < 20:
-                    debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "not_enough_closes"})
                 return
 
             last_close = closes[-1]
             rsi14 = rsi(closes, 14)
             macd_line, macd_sig, macd_hist = macd(closes)
-            sma20 = sma(closes, 20)
-            sma50 = sma(closes, 50)
             sma200 = sma(closes, 200)
 
             above200 = None
@@ -949,8 +771,8 @@ async def compute_technicals_for_ids(
                 "macd": macd_line,
                 "macd_signal": macd_sig,
                 "macd_hist": macd_hist,
-                "sma20": sma20,
-                "sma50": sma50,
+                "sma20": sma(closes, 20),
+                "sma50": sma(closes, 50),
                 "sma200": sma200,
                 "above_sma200": above200,
                 "adv20": adv20,
@@ -958,22 +780,148 @@ async def compute_technicals_for_ids(
                 "illiquid": illiquid,
                 "candles_debug": cdbg,
             }
-
             debug["computed"] += 1
-            if len(debug["samples"]) < 6:
-                debug["samples"].append({
-                    "instrumentID": iid,
-                    "ticker": ticker,
-                    "rsi14": rsi14,
-                    "above_sma200": above200,
-                    "illiquid": illiquid
-                })
 
     await asyncio.gather(*(one(i) for i in ids))
     return tech_map, debug
 
+
 # ============================================================
-# PRESENTATION LAYER
+# FUNDAMENTALS (7 key params) — robust
+# ============================================================
+
+FUND_KEYS = ["market_cap", "pe", "ev_ebitda", "fcf_yield", "net_debt_ebitda", "roic", "dividend_yield"]
+
+
+def normalize_symbol_for_fmp(display_symbol: str) -> str:
+    """
+    FMP generally likes US tickers like 'CCJ', 'ASML', 'BRK-B' etc.
+    eToro/search can return things like:
+      - 'BRK.B'  -> 'BRK-B'
+      - 'RDS.A'  -> 'RDS-A'
+      - 'ASML.NV' / 'BOE.ASX' -> 'ASML' / 'BOE' (best-effort)
+      - 'CEG.US' -> 'CEG'
+    We keep your DISPLAY ticker unchanged in the UI, but query fundamentals on this normalized symbol.
+    """
+    s = (display_symbol or "").upper().strip()
+    if not s:
+        return ""
+    # remove common exchange suffix after dot
+    # keep first segment only (best effort)
+    if "." in s:
+        s = s.split(".", 1)[0]
+    # convert class separator
+    s = s.replace("/", "-")
+    # BRK.B -> BRK-B
+    if "." in s:
+        s = s.replace(".", "-")
+    return s
+
+
+async def fmp_get_json(url: str, params: Dict[str, str]) -> Tuple[Optional[Any], Optional[str]]:
+    if http_client is None:
+        return None, "http_client_not_ready"
+    try:
+        r = await http_client.get(url, params=params)
+        if r.status_code == 429:
+            await asyncio.sleep(2)
+            r = await http_client.get(url, params=params)
+        if r.status_code >= 400:
+            return None, f"http_{r.status_code}"
+        try:
+            data = r.json()
+        except Exception:
+            return None, "bad_json"
+        # FMP errors are often dicts with "Error Message"
+        if isinstance(data, dict) and ("Error Message" in data or "error" in data or "message" in data):
+            return data, "provider_error"
+        return data, None
+    except Exception as e:
+        return None, repr(e)
+
+
+async def get_fundamentals_symbol(display_symbol: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    sym_disp = (display_symbol or "").upper().strip()
+    sym = normalize_symbol_for_fmp(sym_disp)
+    if not sym or looks_like_numeric_id(sym):
+        return {"status": "NO_FUND"}
+
+    cache = state.get("fund_cache") if isinstance(state.get("fund_cache"), dict) else {}
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    cached = cache.get(sym_disp)
+    if isinstance(cached, dict) and cached.get("date") == today:
+        return cached
+
+    if not FMP_API_KEY:
+        out = {"status": "NO_FUND", "date": today, "symbol": sym, "display_symbol": sym_disp, "reason": "missing_FMP_API_KEY"}
+        cache[sym_disp] = out
+        state["fund_cache"] = cache
+        return out
+
+    async with _FUND_SEM:
+        q, qerr = await fmp_get_json(FMP_QUOTE.format(symbol=sym), {"apikey": FMP_API_KEY})
+        km, kmerr = await fmp_get_json(FMP_KEY_METRICS_TTM.format(symbol=sym), {"apikey": FMP_API_KEY})
+        rt, rterr = await fmp_get_json(FMP_RATIOS_TTM.format(symbol=sym), {"apikey": FMP_API_KEY})
+
+    # if any returned provider_error dict, capture it for debug
+    provider_error = None
+    if isinstance(q, dict) and qerr == "provider_error":
+        provider_error = q
+    if isinstance(km, dict) and kmerr == "provider_error":
+        provider_error = provider_error or km
+    if isinstance(rt, dict) and rterr == "provider_error":
+        provider_error = provider_error or rt
+
+    quote0 = q[0] if isinstance(q, list) and q else {}
+    km0 = km[0] if isinstance(km, list) and km else {}
+    rt0 = rt[0] if isinstance(rt, list) and rt else {}
+
+    market_cap = safe_float(quote0.get("marketCap") or quote0.get("mktCap"))
+    pe = safe_float(quote0.get("pe") or quote0.get("peRatio"))
+    ev_ebitda = safe_float(km0.get("enterpriseValueOverEBITDATTM") or rt0.get("enterpriseValueMultipleTTM"))
+    fcf_yield = safe_float(km0.get("freeCashFlowYieldTTM") or rt0.get("freeCashFlowYieldTTM"))
+    net_debt_ebitda = safe_float(km0.get("netDebtToEBITDATTM") or rt0.get("netDebtToEBITDATTM"))
+    roic = safe_float(km0.get("roicTTM") or rt0.get("returnOnCapitalEmployedTTM"))
+    dividend_yield = safe_float(km0.get("dividendYieldTTM") or rt0.get("dividendYieldTTM") or quote0.get("dividendYield"))
+
+    ok = any(v is not None for v in [market_cap, pe, ev_ebitda, fcf_yield, net_debt_ebitda, roic, dividend_yield])
+
+    out = {
+        "status": "ok" if ok else "NO_FUND",
+        "date": today,
+        "symbol": sym,
+        "display_symbol": sym_disp,
+        "market_cap": market_cap,
+        "pe": pe,
+        "ev_ebitda": ev_ebitda,
+        "fcf_yield": fcf_yield,
+        "net_debt_ebitda": net_debt_ebitda,
+        "roic": roic,
+        "dividend_yield": dividend_yield,
+        "errors": {"quote": qerr, "key_metrics": kmerr, "ratios": rterr},
+        "provider_error": provider_error,
+    }
+
+    cache[sym_disp] = out
+    state["fund_cache"] = cache
+    return out
+
+
+async def compute_fundamentals_for_symbols(symbols: List[str], state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    syms = sorted(set((s or "").upper().strip() for s in symbols if s and not looks_like_numeric_id(s)))
+    out: Dict[str, Dict[str, Any]] = {}
+
+    async def one(sym: str):
+        out[sym] = await get_fundamentals_symbol(sym, state)
+
+    await asyncio.gather(*(one(s) for s in syms))
+    await save_state(state)
+    return out
+
+
+# ============================================================
+# PRESENTATION
 # ============================================================
 
 def build_portfolio_rows(
@@ -994,18 +942,14 @@ def build_portfolio_rows(
         if EXCLUDE_CRYPTO and is_crypto_instrument(iid, ticker):
             continue
 
-        initial = normalize_number(a.get("initialAmountInDollars"))
-        unreal = normalize_number(a.get("unrealizedPnL"))
+        initial = safe_float(a.get("initialAmountInDollars"))
+        unreal = safe_float(a.get("unrealizedPnL"))
 
         weight_pct = (initial / total_initial * 100.0) if (total_initial > 0 and initial and initial > 0) else None
         pnl_pct = (unreal / initial * 100.0) if (initial and initial != 0 and unreal is not None) else None
 
         tech = tech_map.get(iid)
-        if tech:
-            tag = tech_tags(tech)
-            tech_status = tag if tag else "OK"
-        else:
-            tech_status = "NO_TECH"
+        tech_status = (tech_tags(tech) or "OK") if tech else "NO_TECH"
 
         fund = fund_map.get(sym) or {"status": "NO_FUND"}
         cat = categorize_ticker(sym, categories)
@@ -1016,18 +960,6 @@ def build_portfolio_rows(
             s, tags = energy_thesis_fit(fund)
             thesis_tags = tags
             thesis_score = str(s) if s is not None else ""
-
-        # 7 key fundamentals as display fields
-        fundamentals_view = {
-            "status": fund_status(fund),
-            "market_cap": fund.get("market_cap"),
-            "pe": fund.get("pe"),
-            "ev_ebitda": fund.get("ev_ebitda"),
-            "fcf_yield": fund.get("fcf_yield"),
-            "net_debt_ebitda": fund.get("net_debt_ebitda"),
-            "roic": fund.get("roic"),
-            "dividend_yield": fund.get("dividend_yield"),
-        }
 
         rows.append({
             "ticker": ticker,
@@ -1040,10 +972,9 @@ def build_portfolio_rows(
             "thesis_tags": thesis_tags,
             "tech_status": tech_status,
             "tech": tech or {},
-            "fundamentals": fundamentals_view,
+            "fundamentals": fund,
         })
 
-    # sort: category, then weight desc
     def fnum(x: Any) -> float:
         try:
             return float(x)
@@ -1075,7 +1006,6 @@ def deterministic_brief(rows: List[Dict[str, Any]]) -> str:
     below200 = [r["ticker"] for r in rows if r.get("tech", {}).get("above_sma200") is False][:12]
     illq = [r["ticker"] for r in rows if r.get("tech", {}).get("illiquid")][:12]
 
-    # Thesis highlights for energy
     energy = [r for r in rows if r.get("category") in ("ENERGY_OIL_GAS", "ENERGY_MIDSTREAM")]
     best_thesis = sorted(
         [(r["ticker"], safe_int(r.get("thesis_score"), -1), r.get("thesis_tags", [])) for r in energy if r.get("thesis_score")],
@@ -1106,19 +1036,15 @@ def deterministic_brief(rows: List[Dict[str, Any]]) -> str:
     lines.append("Notes: No buy/sell instructions. Use as a checklist for research.")
     return "\n".join(lines)
 
-# ============================================================
-# DISCORD (optional)
-# ============================================================
 
 async def discord_notify(text: str) -> None:
-    if not DISCORD_WEBHOOK_URL:
-        return
-    if http_client is None:
+    if not DISCORD_WEBHOOK_URL or http_client is None:
         return
     try:
         await http_client.post(DISCORD_WEBHOOK_URL, json={"content": text})
     except Exception:
         pass
+
 
 # ============================================================
 # ROUTES
@@ -1145,7 +1071,6 @@ async def dashboard():
         lis = "".join([f"<li>{x}</li>" for x in items]) if items else "<li>None</li>"
         return f"<ul>{lis}</ul>"
 
-    # group rows by category
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for r in portfolio:
         grouped[r.get("category") or "OTHER"].append(r)
@@ -1156,13 +1081,21 @@ async def dashboard():
     failed = safe_int(tech_debug.get("failed", 0))
     denom = max(0, req - skp)
 
+    fund_provider = fund_debug.get("provider") or ("FMP" if FMP_API_KEY else "None")
     fund_ok = safe_int(fund_debug.get("ok", 0))
     fund_total = safe_int(fund_debug.get("requested", 0))
-    fund_provider = fund_debug.get("provider") or ("FMP" if FMP_API_KEY else "None")
 
     def fund_cells(f: Dict[str, Any]) -> str:
         if not isinstance(f, dict) or f.get("status") != "ok":
-            return "<td colspan='7'>NO_FUND</td>"
+            # show why (helps immediately)
+            reason = (f or {}).get("reason") or ""
+            perr = (f or {}).get("provider_error")
+            hint = ""
+            if reason:
+                hint = f" ({reason})"
+            elif perr:
+                hint = " (provider_error)"
+            return f"<td colspan='7'>NO_FUND{hint}</td>"
         return (
             f"<td>{fmt_big(f.get('market_cap'))}</td>"
             f"<td>{fmt(f.get('pe'),2)}</td>"
@@ -1174,15 +1107,7 @@ async def dashboard():
         )
 
     sections_html = ""
-    order = [
-        "ENERGY_OIL_GAS",
-        "ENERGY_MIDSTREAM",
-        "NUCLEAR_URANIUM",
-        "TECH_SEMI_DATACENTER",
-        "QUANTUM",
-        "GOLD_PGM_MINERS",
-        "OTHER",
-    ]
+    order = ["ENERGY_OIL_GAS","ENERGY_MIDSTREAM","NUCLEAR_URANIUM","TECH_SEMI_DATACENTER","QUANTUM","GOLD_PGM_MINERS","OTHER"]
     for cat in order:
         rows = grouped.get(cat) or []
         if not rows:
@@ -1193,8 +1118,6 @@ async def dashboard():
             thesis = r.get("thesis_score", "")
             ttags = " ".join(r.get("thesis_tags") or [])
             thesis_cell = f"{thesis} {ttags}".strip()
-            if not thesis_cell:
-                thesis_cell = ""
             body += (
                 "<tr>"
                 f"<td>{r.get('ticker','')}</td>"
@@ -1283,7 +1206,8 @@ async def dashboard():
 
         <p class="small">
           API: <code>/api/portfolio</code> • <code>/api/daily-brief</code> • <code>/api/categories</code> •
-          Debug: <code>/debug/mapping-last</code> • <code>/debug/tech-last</code> • <code>/debug/candles?ticker=CCJ</code> • <code>/debug/etoro-candles?instrument_id=10721</code>
+          Debug: <code>/debug/mapping-last</code> • <code>/debug/tech-last</code> •
+          <code>/debug/fund?symbol=CCJ</code> • <code>/debug/fund-last</code>
         </p>
       </body>
     </html>
@@ -1317,14 +1241,12 @@ async def run_daily():
 
         instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
 
-        # 1) Mapping
-        ticker_cache, _map_dbg = await map_instrument_ids_to_tickers_search(instrument_ids, state)
+        # 1) mapping
+        ticker_cache, _ = await map_instrument_ids_to_tickers_search(instrument_ids, state)
         mapping = state.get("mapping") or {"cached": 0, "total": len(instrument_ids)}
-        material_events.append(
-            f"Resolved tickers: {mapping.get('cached',0)}/{mapping.get('total',len(instrument_ids))} (see /debug/mapping-last)"
-        )
+        material_events.append(f"Resolved tickers: {mapping.get('cached',0)}/{mapping.get('total',len(instrument_ids))}")
 
-        # 2) Technicals
+        # 2) technicals
         tech_map, tech_dbg = await compute_technicals_for_ids(instrument_ids, ticker_cache)
         state["tech_debug"] = tech_dbg
 
@@ -1333,8 +1255,8 @@ async def run_daily():
         if safe_int(tech_dbg.get("skipped", 0)) > 0:
             material_events.append(f"Skipped {tech_dbg.get('skipped')} instruments (no ticker / crypto excluded).")
 
-        # 3) Fundamentals (for the mapped tickers only)
-        tickers = []
+        # 3) fundamentals
+        tickers: List[str] = []
         for iid in instrument_ids:
             t = (ticker_cache.get(iid) or "").strip().upper()
             if not t or looks_like_numeric_id(t):
@@ -1344,26 +1266,46 @@ async def run_daily():
             tickers.append(t)
 
         fund_map = await compute_fundamentals_for_symbols(tickers, state)
-        fund_ok = sum(1 for s in tickers if fund_map.get(s, {}).get("status") == "ok")
+
+        # debug counters
+        uniq = sorted(set(tickers))
+        ok = 0
+        provider_errors = 0
+        missing_key = 0
+        samples = []
+        for s in uniq:
+            f = fund_map.get(s) or {}
+            if f.get("status") == "ok":
+                ok += 1
+            if f.get("reason") == "missing_FMP_API_KEY":
+                missing_key += 1
+            if f.get("provider_error"):
+                provider_errors += 1
+            if len(samples) < 6:
+                samples.append({"display": s, "symbol": f.get("symbol"), "status": f.get("status"), "errors": f.get("errors"), "provider_error": bool(f.get("provider_error"))})
+
         state["fund_debug"] = {
             "provider": "FMP" if FMP_API_KEY else "None",
-            "requested": len(sorted(set(tickers))),
-            "ok": fund_ok,
+            "requested": len(uniq),
+            "ok": ok,
+            "missing_key": missing_key,
+            "provider_errors": provider_errors,
+            "samples": samples,
         }
 
-        # 4) Portfolio rows (categorized + thesis-fit + 7 fundamentals)
+        # 4) rows
         portfolio_rows = build_portfolio_rows(agg_positions, ticker_cache, tech_map, fund_map, categories)
 
-        # 5) Brief
+        # 5) brief
         brief = deterministic_brief(portfolio_rows)
 
-        # 6) Discord (optional)
+        # 6) notify
         tech_done = safe_int(tech_dbg.get("computed", 0))
         tech_req = safe_int(tech_dbg.get("requested", len(instrument_ids)))
         tech_skip = safe_int(tech_dbg.get("skipped", 0))
         tech_den = max(0, tech_req - tech_skip)
         await discord_notify(
-            f"✅ Daily done | tickers {mapping.get('cached',0)}/{len(instrument_ids)} | tech {tech_done}/{tech_den} | fund {fund_ok}/{len(sorted(set(tickers)))}"
+            f"✅ Daily done | tickers {mapping.get('cached',0)}/{len(instrument_ids)} | tech {tech_done}/{tech_den} | fund {ok}/{len(uniq)}"
         )
 
         state.update({
@@ -1387,8 +1329,11 @@ async def run_daily():
             "technicals_computed": tech_done,
             "technicals_requested": tech_den,
             "technicals_skipped": tech_skip,
-            "fundamentals_ok": fund_ok,
-            "fundamentals_requested": len(sorted(set(tickers))),
+            "fundamentals_ok": ok,
+            "fundamentals_requested": len(uniq),
+            "fund_provider": state["fund_debug"]["provider"],
+            "fund_provider_errors": provider_errors,
+            "fund_missing_key": missing_key,
         }
 
 
@@ -1446,38 +1391,30 @@ async def debug_tech_last():
     return JSONResponse(state.get("tech_debug") or {"note": "Run /tasks/daily first."})
 
 
-@app.get("/debug/candles")
-async def debug_candles(
-    ticker: str = Query(..., description="Try: CCJ, ASML, CEG, ALB, STEM, RKLB"),
-):
-    candles, dbg = await stooq_get_daily_candles(ticker, count=180)
-    sample = candles[-3:] if candles else []
-    return JSONResponse({"ticker": ticker, "debug": dbg, "rows": len(candles), "sample": sample})
+@app.get("/debug/fund-last")
+async def debug_fund_last():
+    state = await load_state()
+    return JSONResponse(state.get("fund_debug") or {"note": "Run /tasks/daily first."})
 
 
-@app.get("/debug/etoro-candles")
-async def debug_etoro_candles(
-    instrument_id: int = Query(..., description="numeric instrumentID from your table"),
+@app.get("/debug/fund")
+async def debug_fund(
+    symbol: str = Query(..., description="Try: CCJ, LEU, EQT, WMB, ASML, RGTI"),
 ):
-    candles, dbg = await etoro_get_daily_candles(instrument_id, count=260)
-    sample = candles[-3:] if candles else []
-    return JSONResponse({"instrumentId": instrument_id, "debug": dbg, "rows": len(candles), "sample": sample})
+    state = await load_state()
+    f = await get_fundamentals_symbol(symbol, state)
+    await save_state(state)
+    return JSONResponse({"input": symbol, "normalized": normalize_symbol_for_fmp(symbol), "fundamentals": f})
 
 
 @app.post("/admin/seed-mapping")
 async def admin_seed_mapping(request: Request):
-    """
-    If some instrumentIDs never map via /search, seed them once.
-    POST JSON: {"9031":"STEM","9085":"RKLB"}
-    """
     require_admin(request)
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Body must be JSON object: {instrumentId: ticker}")
-
     state = await load_state()
     cache_raw = state.get("ticker_cache") or {}
-
     seeded = 0
     for k, v in body.items():
         try:
@@ -1488,7 +1425,6 @@ async def admin_seed_mapping(request: Request):
         if sym:
             cache_raw[str(iid)] = sym
             seeded += 1
-
     state["ticker_cache"] = cache_raw
     await save_state(state)
     return {"status": "ok", "seeded": seeded, "note": "Run /tasks/daily again."}
@@ -1496,32 +1432,16 @@ async def admin_seed_mapping(request: Request):
 
 @app.post("/admin/set-categories")
 async def admin_set_categories(request: Request):
-    """
-    Override category mapping.
-    POST JSON like:
-    {
-      "ENERGY_OIL_GAS": ["EQT","DVN"],
-      "NUCLEAR_URANIUM": ["CCJ","LEU"],
-      "QUANTUM": ["IONQ","RGTI"],
-      "OTHER": []
-    }
-    """
     require_admin(request)
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Body must be JSON object of {category: [tickers]}")
-
     cleaned: Dict[str, List[str]] = {}
     for k, v in body.items():
-        if not isinstance(k, str):
-            continue
-        if not isinstance(v, list):
-            continue
-        cleaned[k.strip().upper()] = [str(x).upper().strip() for x in v if str(x).strip()]
-
+        if isinstance(k, str) and isinstance(v, list):
+            cleaned[k.strip().upper()] = [str(x).upper().strip() for x in v if str(x).strip()]
     if not cleaned:
         raise HTTPException(status_code=400, detail="No valid categories provided.")
-
     state = await load_state()
     state["categories"] = cleaned
     await save_state(state)
