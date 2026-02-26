@@ -1,9 +1,4 @@
 # main.py
-# Investing agent core (silent by default).
-# - Works both as:
-#   1) CLI one-shot: `python main.py`  -> writes agent_output.json, prints nothing unless fatal
-#   2) Importable module: app.py can call run_agent() under Hypercorn/ASGI
-
 from __future__ import annotations
 
 import os
@@ -40,12 +35,11 @@ class FetchResult:
 class Timer:
     def __enter__(self):
         self.t0 = time.perf_counter()
-        self.elapsed_ms = 0  # always exists
+        self.elapsed_ms = 0
         return self
 
     @property
     def ms(self) -> int:
-        # safe to call anytime (inside or after the with-block)
         return int((time.perf_counter() - self.t0) * 1000)
 
     def __exit__(self, exc_type, exc, tb):
@@ -68,6 +62,64 @@ def ensure_dir_for_file(path: str) -> None:
 
 
 # ----------------------------
+# OpenAI brief (optional)
+# ----------------------------
+
+def summarize_brief_with_openai(status_obj: Dict[str, Any]) -> str:
+    """
+    Uses OpenAI to produce a short daily brief from the agent output.
+    Returns a string. If OPENAI_API_KEY isn't set, returns "".
+    """
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return ""
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+
+        # Keep payload small but useful
+        results = status_obj.get("results", {}) or {}
+        symbols = list(results.keys())
+
+        compact: Dict[str, Any] = {
+            "warnings": status_obj.get("warnings", []),
+            "symbols": [],
+        }
+
+        # include top news+filings titles (small payload)
+        for sym in symbols[:40]:
+            r = results.get(sym, {}) or {}
+            news = r.get("news", []) or []
+            filings = r.get("filings", []) or []
+            compact["symbols"].append(
+                {
+                    "symbol": sym,
+                    "thesis_score": (r.get("thesis", {}) or {}).get("thesis_score"),
+                    "news_titles": [n.get("title") for n in news[:3] if isinstance(n, dict)],
+                    "filings": [
+                        {"type": f.get("type"), "filed_at": f.get("filed_at")}
+                        for f in filings[:3]
+                        if isinstance(f, dict)
+                    ],
+                }
+            )
+
+        resp = client.responses.create(
+            model="gpt-4.1-mini",
+            input=(
+                "Write a concise daily investing brief based on this JSON. "
+                "Focus on material news + notable filings. Use bullet points. No fluff. "
+                "If nothing is material, say that.\n\n"
+                f"{json.dumps(compact, ensure_ascii=False)}"
+            ),
+        )
+        return (resp.output_text or "").strip()
+    except Exception:
+        return ""
+
+
+# ----------------------------
 # News provider: Google News RSS (no API key)
 # ----------------------------
 
@@ -80,10 +132,6 @@ def fetch_news_google_rss(
     max_items: int = 5,
     timeout: int = 12,
 ) -> Tuple[Optional[int], List[Dict[str, Any]]]:
-    """
-    Returns (http_status, items)
-    Each item: {published_at, source, title, url}
-    """
     if company_name:
         q = f'("{symbol}" OR "{company_name}") (stock OR shares OR earnings OR guidance OR acquisition OR merger)'
     else:
@@ -140,9 +188,6 @@ def sec_headers(user_agent: str) -> Dict[str, str]:
 
 
 def load_sec_cik_map(user_agent: str, timeout: int = 15) -> Tuple[Optional[int], Dict[str, str]]:
-    """
-    Returns (http_status, map[ticker]=10-digit CIK string)
-    """
     r = requests.get(SEC_TICKER_CIK_URL, headers=sec_headers(user_agent), timeout=timeout)
     if r.status_code != 200:
         return r.status_code, {}
@@ -164,14 +209,10 @@ def fetch_latest_filings_sec(
     max_items: int = 6,
     timeout: int = 15,
 ) -> Tuple[Optional[int], List[Dict[str, Any]]]:
-    """
-    Returns (http_status, items)
-    Each item: {type, filed_at, accession, report_date, primary_doc, url}
-    """
     tkr = symbol.upper().strip()
     cik = cik_map.get(tkr)
     if not cik:
-        return None, []  # not supported / non-US / not in SEC map
+        return None, []
 
     url = SEC_SUBMISSIONS_URL.format(cik=cik)
     r = requests.get(url, headers=sec_headers(user_agent), timeout=timeout)
@@ -217,7 +258,7 @@ def fetch_latest_filings_sec(
 
 
 # ----------------------------
-# Energy thesis scoring (rule-based, no narrative output)
+# Energy thesis scoring (rule-based)
 # ----------------------------
 
 DEFAULT_THESIS_RULES: Dict[str, Any] = {
@@ -355,7 +396,7 @@ def load_facts(path: str = "facts.json") -> Dict[str, Dict[str, Any]]:
 
 
 # ----------------------------
-# Main agent runner (silent)
+# Main agent runner
 # ----------------------------
 
 def run_agent() -> Dict[str, Any]:
@@ -394,24 +435,18 @@ def run_agent() -> Dict[str, Any]:
         facts = facts_db.get(sym, {})
         results[sym]["thesis"] = score_energy_thesis(sym, facts, rules)
 
-        # News
         with Timer() as t:
             try:
                 http_code, items = fetch_news_google_rss(sym, company_name=company_names.get(sym))
                 status = "ok" if items else "empty"
                 if items:
                     news_fetched += 1
-                telemetry.append(
-                    FetchResult(sym, "google_rss", "news", status, http_code, t.ms, len(items)).to_dict()
-                )
+                telemetry.append(FetchResult(sym, "google_rss", "news", status, http_code, t.ms, len(items)).to_dict())
                 results[sym]["news"] = items
             except Exception as e:
-                telemetry.append(
-                    FetchResult(sym, "google_rss", "news", "error", None, t.ms, 0, safe_err(e)).to_dict()
-                )
+                telemetry.append(FetchResult(sym, "google_rss", "news", "error", None, t.ms, 0, safe_err(e)).to_dict())
                 results[sym]["news"] = []
 
-        # Filings (rate-limit a bit to avoid SEC 429)
         with Timer() as t:
             try:
                 http_code, items = fetch_latest_filings_sec(sym, cik_map, sec_user_agent)
@@ -421,14 +456,10 @@ def run_agent() -> Dict[str, Any]:
                     status = "ok" if items else "empty"
                 if items:
                     filings_fetched += 1
-                telemetry.append(
-                    FetchResult(sym, "sec_edgar", "filings", status, http_code, t.ms, len(items)).to_dict()
-                )
+                telemetry.append(FetchResult(sym, "sec_edgar", "filings", status, http_code, t.ms, len(items)).to_dict())
                 results[sym]["filings"] = items
             except Exception as e:
-                telemetry.append(
-                    FetchResult(sym, "sec_edgar", "filings", "error", None, t.ms, 0, safe_err(e)).to_dict()
-                )
+                telemetry.append(FetchResult(sym, "sec_edgar", "filings", "error", None, t.ms, 0, safe_err(e)).to_dict())
                 results[sym]["filings"] = []
 
         time.sleep(0.35)
@@ -454,6 +485,11 @@ def run_agent() -> Dict[str, Any]:
         status_obj.setdefault("warnings", []).append(
             "Filings fetched zero across all symbols (non-US symbols or SEC blocked). Check telemetry + SEC_USER_AGENT."
         )
+
+    # ✅ OpenAI daily brief (optional)
+    brief = summarize_brief_with_openai(status_obj)
+    if brief:
+        status_obj["openai_brief"] = brief
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(status_obj, f, ensure_ascii=False, indent=2)
