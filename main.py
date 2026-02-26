@@ -10,6 +10,20 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+# ----------------------------
+# Universe controls
+# ----------------------------
+# Goal: NO cryptos, only stocks/ETFs. We filter by ticker after mapping.
+EXCLUDE_CRYPTO = os.getenv("EXCLUDE_CRYPTO", "true").strip().lower() in ("1", "true", "yes", "y")
+CRYPTO_DENY = {
+    x.strip().upper()
+    for x in os.getenv(
+        "CRYPTO_DENY",
+        "BTC,ETH,SOL,ADA,XRP,DOT,AVAX,LINK,OP,RUNE,WLD,JTO,ARB,ATOM,NEAR,APT,SUI",
+    ).split(",")
+    if x.strip()
+}
+
 app = FastAPI(title="My AI Investing Agent")
 
 # ----------------------------
@@ -175,6 +189,20 @@ def _extract_ticker_from_search_item(item: Dict[str, Any]) -> str:
     return ""
 
 
+def is_crypto_ticker(ticker: str) -> bool:
+    """Best-effort crypto detection from mapped ticker symbol."""
+    t = (ticker or "").upper().strip()
+    if not t:
+        return False
+    if t in CRYPTO_DENY:
+        return True
+    # Common crypto pair shapes
+    if t.endswith("-USD") or t.endswith("USD") or t.endswith("USDT"):
+        return True
+    # eToro sometimes returns symbols like "BTC" or "BTCX" etc; denylist covers the common ones.
+    return False
+
+
 async def map_instrument_ids_to_tickers_search(instrument_ids: List[int]) -> Tuple[Dict[int, str], Dict[str, Any]]:
     """
     Reverse mapping via /market-data/search, no fields param.
@@ -245,6 +273,79 @@ async def etoro_get_daily_candles(instrument_id: int, count: int = 250) -> List[
     if not isinstance(inner, list):
         return []
     return [c for c in inner if isinstance(c, dict)]
+
+
+# ----------------------------
+# Stock candles (no keys) via Stooq
+# ----------------------------
+async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Fetch daily OHLCV candles from Stooq CSV endpoint.
+
+    Works well for US listings when using the ".us" suffix.
+    Returns (candles, debug)
+    """
+    t = (ticker or "").strip()
+    dbg: Dict[str, Any] = {"provider": "stooq", "input": ticker, "requested": count, "status": "init", "http": None, "error": None}
+    if not t:
+        dbg["status"] = "empty_ticker"
+        return [], dbg
+
+    # Normalize for Stooq: lower + .us for equities by default.
+    # If user already has suffix (e.g., ".us"), keep it.
+    s = t.lower()
+    if "." not in s:
+        s = f"{s}.us"
+
+    url = "https://stooq.com/q/d/l/"
+    params = {"s": s, "i": "d"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, params=params, headers={"accept": "text/csv"})
+            dbg["http"] = r.status_code
+            if r.status_code >= 400:
+                dbg["status"] = "http_error"
+                dbg["error"] = (r.text or "")[:300]
+                return [], dbg
+            text = r.text or ""
+    except Exception as e:
+        dbg["status"] = "exception"
+        dbg["error"] = repr(e)
+        return [], dbg
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2 or "date" not in lines[0].lower():
+        dbg["status"] = "bad_csv"
+        dbg["error"] = (text or "")[:300]
+        return [], dbg
+
+    # CSV header: Date,Open,High,Low,Close,Volume
+    candles: List[Dict[str, Any]] = []
+    for ln in lines[1:]:
+        parts = ln.split(",")
+        if len(parts) < 6:
+            continue
+        d, o, h, l, c, v = parts[:6]
+        try:
+            candles.append({
+                "fromDate": d,
+                "open": float(o),
+                "high": float(h),
+                "low": float(l),
+                "close": float(c),
+                "volume": float(v) if v not in ("", "-") else 0.0,
+            })
+        except Exception:
+            continue
+
+    if not candles:
+        dbg["status"] = "no_rows"
+        return [], dbg
+
+    # Stooq returns oldest->newest; keep last N
+    candles = candles[-max(1, int(count)) :]
+    dbg["status"] = "ok"
+    dbg["rows"] = len(candles)
+    return candles, dbg
 
 
 # ----------------------------
@@ -457,23 +558,44 @@ def build_portfolio_rows(
     return rows
 
 
-async def compute_technicals_for_ids(instrument_ids: List[int]) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
-    """
-    Fetch candles and compute indicators with a concurrency cap.
+async def compute_technicals_for_ids(
+    instrument_ids: List[int],
+    ticker_map: Dict[int, str],
+    candles_count: int = 260,
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
+    """Fetch daily candles (stocks only) and compute indicators.
+
+    Important: we intentionally do NOT rely on the eToro candles endpoint here,
+    because it was returning empty for all instruments in your production run.
+    Using Stooq gives you a stable baseline with no API keys.
     """
     ids = sorted(set(int(x) for x in instrument_ids if x is not None))
     tech_map: Dict[int, Dict[str, Any]] = {}
-    debug = {"requested": len(ids), "computed": 0, "failed": 0, "samples": []}
+    debug: Dict[str, Any] = {
+        "provider": "stooq",
+        "requested": len(ids),
+        "computed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "samples": [],
+    }
 
     sem = asyncio.Semaphore(7)  # safe parallelism
 
     async def one(iid: int):
         async with sem:
-            candles = await etoro_get_daily_candles(iid, 250)
+            ticker = ticker_map.get(iid) or ""
+            if EXCLUDE_CRYPTO and is_crypto_ticker(ticker):
+                debug["skipped"] += 1
+                if len(debug["samples"]) < 10:
+                    debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "skipped_crypto"})
+                return
+
+            candles, cdbg = await stooq_get_daily_candles(ticker, count=candles_count)
             if not candles or len(candles) < 60:
                 debug["failed"] += 1
                 if len(debug["samples"]) < 10:
-                    debug["samples"].append({"instrumentID": iid, "status": "no_candles"})
+                    debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "no_candles", "cdbg": cdbg})
                 return
 
             closes = [normalize_number(c.get("close")) for c in candles]
@@ -484,7 +606,7 @@ async def compute_technicals_for_ids(instrument_ids: List[int]) -> Tuple[Dict[in
             if len(closes) < 60:
                 debug["failed"] += 1
                 if len(debug["samples"]) < 10:
-                    debug["samples"].append({"instrumentID": iid, "status": "not_enough_closes"})
+                    debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "not_enough_closes", "cdbg": cdbg})
                 return
 
             last_close = closes[-1]
@@ -527,11 +649,12 @@ async def compute_technicals_for_ids(instrument_ids: List[int]) -> Tuple[Dict[in
                 "adv20": adv20,
                 "dollar_adv20": dollar_adv20,
                 "illiquid": illiquid,
+                "candles_provider": "stooq",
             }
 
             debug["computed"] += 1
             if len(debug["samples"]) < 5:
-                debug["samples"].append({"instrumentID": iid, "rsi14": rsi14, "above_sma200": above200, "illiquid": illiquid})
+                debug["samples"].append({"instrumentID": iid, "ticker": ticker, "rsi14": rsi14, "above_sma200": above200, "illiquid": illiquid})
 
     await asyncio.gather(*(one(i) for i in ids))
     return tech_map, debug
@@ -592,7 +715,7 @@ async def dashboard():
         <p><b>Last update:</b> {last_update}</p>
         <p><b>eToro:</b> Lots = {stats.get("lots_count","")} | Unique instruments = {stats.get("unique_instruments_count","")}</p>
         <p><b>Mapping cache:</b> {mapping.get("cached","")}/{mapping.get("total","")} cached</p>
-        <p><b>Technicals:</b> computed {tech_debug.get("computed","")}/{tech_debug.get("requested","")} (failed {tech_debug.get("failed","")})</p>
+        <p><b>Technicals:</b> computed {tech_debug.get("computed","")}/{max(0, int(tech_debug.get("requested",0) or 0) - int(tech_debug.get("skipped",0) or 0))} (failed {tech_debug.get("failed","")}, skipped {tech_debug.get("skipped",0)})</p>
 
         <h2>Material Events</h2>
         {bullets(material_events)}
@@ -681,12 +804,27 @@ async def run_daily():
     state["mapping"] = {"cached": len([iid for iid in instrument_ids if iid in ticker_cache]), "total": len(instrument_ids)}
 
     # ----------------------------
-    # (2) Technicals via eToro candles
+    # Filter universe: NO cryptos (positions + technicals)
     # ----------------------------
-    tech_map, tech_dbg = await compute_technicals_for_ids(instrument_ids)
+    if EXCLUDE_CRYPTO:
+        stock_ids = [iid for iid in instrument_ids if not is_crypto_ticker(ticker_cache.get(iid, ""))]
+        stock_set = set(stock_ids)
+        agg_positions = [p for p in agg_positions if int(p.get("instrumentID")) in stock_set]
+        instrument_ids = stock_ids
+        material_events.append(f"Universe filter: stocks only. Instruments after filter: {len(instrument_ids)}")
+
+    # ----------------------------
+    # (2) Technicals (stocks only)
+    #     We compute technicals off a stock market data source, not crypto.
+    # ----------------------------
+    tech_map, tech_dbg = await compute_technicals_for_ids(instrument_ids, ticker_cache)
     state["tech_debug"] = tech_dbg
     if tech_dbg.get("failed", 0) > 0:
-        technical_exceptions.append(f"Candles missing for {tech_dbg.get('failed')} instruments (see /debug/tech-last).")
+        technical_exceptions.append(
+            f"Candles missing for {tech_dbg.get('failed')} instruments (see /debug/tech-last)."
+        )
+    if tech_dbg.get("skipped", 0) > 0 and EXCLUDE_CRYPTO:
+        material_events.append(f"Crypto excluded: skipped {tech_dbg.get('skipped')} instruments.")
 
     # ----------------------------
     # Build final portfolio rows
@@ -705,7 +843,10 @@ async def run_daily():
     # ----------------------------
     mapped_count = state["mapping"]["cached"]
     tech_done = tech_dbg.get("computed", 0)
-    msg = f"✅ Daily done | tickers {mapped_count}/{len(instrument_ids)} | tech {tech_done}/{len(instrument_ids)}"
+    tech_req = tech_dbg.get("requested", len(instrument_ids))
+    tech_skip = tech_dbg.get("skipped", 0)
+    tech_den = max(0, int(tech_req) - int(tech_skip))
+    msg = f"✅ Daily done | tickers {mapped_count}/{len(instrument_ids)} | tech {tech_done}/{tech_den}"
     await discord_notify(msg)
 
     # Save state for dashboard/API
@@ -726,6 +867,8 @@ async def run_daily():
         "unique_instruments": stats["unique_instruments_count"],
         "mapped_symbols": mapped_count,
         "technicals_computed": tech_done,
+        "technicals_requested": tech_den,
+        "technicals_skipped": tech_skip,
     }
 
 
@@ -766,3 +909,13 @@ async def debug_mapping_last():
 async def debug_tech_last():
     state = load_state()
     return JSONResponse(state.get("tech_debug") or {"note": "Run /tasks/daily first."})
+
+
+@app.get("/debug/candles")
+async def debug_candles(ticker: str):
+    """Debug endpoint: fetch candles for a single ticker (stocks only)."""
+    if EXCLUDE_CRYPTO and is_crypto_ticker(ticker):
+        return JSONResponse({"ticker": ticker, "status": "skipped_crypto"})
+    candles, dbg = await stooq_get_daily_candles(ticker, count=120)
+    sample = candles[-3:] if candles else []
+    return JSONResponse({"ticker": ticker, "debug": dbg, "rows": len(candles), "sample": sample})
