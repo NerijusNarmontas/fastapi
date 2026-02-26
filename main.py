@@ -38,7 +38,7 @@ CRYPTO_DENY = {
     for x in os.getenv(
         # NOTE: CRO added (your debug showed CRO slipping through).
         "CRYPTO_DENY",
-        "BTC,ETH,SOL,ADA,XRP,DOT,AVAX,LINK,OP,RUNE,WLD,JTO,ARB,ATOM,NEAR,APT,SUI,CRO",
+        "BTC,ETH,SOL,ADA,XRP,DOT,AVAX,LINK,OP,RUNE,WLD,JTO,ARB,ATOM,NEAR,APT,SUI,CRO,SEI, W, STRK, PYTH, HBAR, EIGEN, HYPE",
     ).split(",")
     if x.strip()
 }
