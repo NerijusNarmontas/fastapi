@@ -4,11 +4,11 @@
 # - Technical line per holding (1M, RSI, 200DMA trend, Liquidity)
 # - Click ticker -> /t/{TICKER} shows cached News + SEC links
 #
-# NEW: Energy Universe Scanner (free sources)
-# - Universe auto-built from StockAnalysis Energy sector list (hundreds) + URA holdings CSV
-# - Fundamentals (US-first) from SEC companyfacts (free, official) -> FCF + shares trend when available
-# - Technicals from Stooq -> 1M/RSI/200DMA/Liq
-# - Outputs ranked candidates with Core/Satellite/Avoid buckets and a simple thesis-fit score
+# FIX (your issue):
+# - Stooq often requires US tickers as TICKER.US (ex: EQT.US)
+# - Linking to TradingView does NOT provide data to your app.
+# - This code now auto-tries .US FIRST when the instrument exchange looks like NYSE/NASDAQ/AMEX/US,
+#   and also when the ticker is a typical US format (A-Z, 1-5 chars).
 #
 # Railway startCommand:
 #   hypercorn main:app --bind "0.0.0.0:$PORT"
@@ -27,7 +27,7 @@ from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 
@@ -63,7 +63,6 @@ DEFAULT_UA = os.getenv(
 
 SEC_UA = os.getenv("SEC_UA", "").strip()
 
-# news/sec cache sizes for ticker detail page
 NEWS_PER_TICKER = int(os.getenv("NEWS_PER_TICKER", "6"))
 SEC_PER_TICKER = int(os.getenv("SEC_PER_TICKER", "6"))
 
@@ -71,20 +70,14 @@ HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "25"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "12"))
 
 # --- Energy scanner config ---
-# Universe sources:
-#   stockanalysis = pull https://stockanalysis.com/stocks/sector/energy/ (big list)
-#   ura_csv      = pull Global X URA full holdings CSV (uranium/nuclear complex)
-ENERGY_UNIVERSE_MAX = int(os.getenv("ENERGY_UNIVERSE_MAX", "900"))  # limit to keep scans sane on free infra
-ENERGY_SCAN_MAX = int(os.getenv("ENERGY_SCAN_MAX", "350"))          # max tickers per scan run (avoid timeouts)
+ENERGY_UNIVERSE_MAX = int(os.getenv("ENERGY_UNIVERSE_MAX", "900"))
+ENERGY_SCAN_MAX = int(os.getenv("ENERGY_SCAN_MAX", "350"))
 ENERGY_SCAN_MODE = os.getenv("ENERGY_SCAN_MODE", "stockanalysis+ura").strip().lower()
 
-# Optional manual additions / overrides:
-# Comma-separated tickers you want always included in scanner
 ENERGY_UNIVERSE_EXTRA = [
     x.strip().upper() for x in os.getenv("ENERGY_UNIVERSE_EXTRA", "").split(",") if x.strip()
 ]
 
-# Exclude refiners by default (your thesis). Extend if needed.
 REFINER_EXCLUDE = set(
     x.strip().upper() for x in os.getenv(
         "REFINER_EXCLUDE",
@@ -92,7 +85,6 @@ REFINER_EXCLUDE = set(
     ).split(",") if x.strip()
 )
 
-# Crypto handling (keep your existing behavior)
 CRYPTO_EXCLUDE = set(s.strip().upper() for s in os.getenv("CRYPTO_EXCLUDE", "W").split(",") if s.strip())
 CRYPTO_TICKERS = set(
     s.strip().upper()
@@ -391,18 +383,71 @@ def build_portfolio_rows(agg: List[Dict[str, Any]], ticker_map: Dict[int, str]) 
 
 
 # ----------------------------
-# TECH METRICS (Stooq)
+# TECH METRICS (Stooq) — FIXED
 # ----------------------------
-def _stooq_symbol_candidates(ticker: str) -> List[str]:
+_US_EXCHANGE_HINTS = (
+    "NYSE", "NASDAQ", "AMEX", "ARCA", "BATS", "CBOE", "US", "USA",
+    "NEW YORK", "N.Y.", "NMS", "NCM", "NQ"
+)
+
+def _looks_us_common_ticker(t: str) -> bool:
+    # Stooq’s pain point: US tickers often need .US; this catches EQT/AAPL/MSFT/etc.
+    # Avoid false positives for already-suffixed tickers and for crypto pairs.
+    if not t:
+        return False
+    if "." in t:
+        return False
+    if "-" in t:
+        # could be BRK-B type; still US, but keep conservative
+        return False
+    return bool(re.fullmatch(r"[A-Z]{1,5}", t))
+
+def _exchange_is_us(exchange: str) -> bool:
+    ex = (exchange or "").strip().upper()
+    if not ex:
+        return False
+    return any(h in ex for h in _US_EXCHANGE_HINTS)
+
+def _stooq_symbol_candidates(ticker: str, exchange: str = "") -> List[str]:
+    """
+    Order matters. For US, try TICKER.US first.
+    For already-suffixed, keep it.
+    """
     t = normalize_ticker(ticker)
+    ex = (exchange or "").strip()
+
+    cands: List[str] = []
+
+    # If already provided in stooq-style
     if t.endswith(".US"):
         base = t[:-3]
-        return [f"{base}.US", base, t]
-    return [t, t.replace("-", "."), t.replace(".", "-")]
+        cands.extend([t, base])
+    else:
+        # If we have an exchange hint that it is US-listed (NYSE/NASDAQ/etc), try .US first.
+        if _exchange_is_us(ex) and _looks_us_common_ticker(t):
+            cands.append(f"{t}.US")
+
+        # Also if it just looks like a normal US ticker, try .US first anyway (helps EQT).
+        if _looks_us_common_ticker(t):
+            cands.append(f"{t}.US")
+
+        # Then fall back to raw / normalized variants
+        cands.extend([t, t.replace("-", "."), t.replace(".", "-")])
+
+    # de-dupe preserving order
+    out = []
+    seen = set()
+    for s in cands:
+        ss = normalize_ticker(s)
+        if not ss or ss in seen:
+            continue
+        seen.add(ss)
+        out.append(ss)
+    return out
 
 
-async def fetch_stooq_daily(client: httpx.AsyncClient, ticker: str) -> List[Dict[str, float]]:
-    for sym in _stooq_symbol_candidates(ticker):
+async def fetch_stooq_daily(client: httpx.AsyncClient, ticker: str, exchange: str = "") -> List[Dict[str, float]]:
+    for sym in _stooq_symbol_candidates(ticker, exchange):
         url = f"https://stooq.com/q/d/l/?s={sym.lower()}&i=d"
         r = await client.get(url, headers={"user-agent": DEFAULT_UA})
         if r.status_code != 200 or "Date,Open,High,Low,Close,Volume" not in r.text:
@@ -520,19 +565,24 @@ def build_compact_line(ticker: str, bars: List[Dict[str, float]]) -> Dict[str, A
     }
 
 
-async def compute_tech_cache(tickers: List[str]) -> Dict[str, Any]:
+async def compute_tech_cache(tickers: List[str], exchange_map: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """
+    exchange_map: {TICKER: exchange_string} so we can decide .US first for NYSE/NASDAQ.
+    """
     sem = asyncio.Semaphore(CONCURRENCY)
     tech_cache: Dict[str, Any] = {}
+    exchange_map = exchange_map or {}
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
 
         async def do_one(t: str):
             async with sem:
-                bars = await fetch_stooq_daily(client, t)
+                ex = exchange_map.get(t, "")
+                bars = await fetch_stooq_daily(client, t, ex)
                 if bars:
                     tech_cache[t] = build_compact_line(t, bars)
                 else:
-                    tech_cache[t] = {"ticker": t, "compact": "Tech NA", "warn": False, "liq": "NA"}
+                    tech_cache[t] = {"ticker": t, "compact": "Tech NA", "warn": False, "liq": "NA", "note": "symbol not available on Stooq"}
 
         await asyncio.gather(*(do_one(t) for t in tickers))
 
@@ -540,7 +590,7 @@ async def compute_tech_cache(tickers: List[str]) -> Dict[str, Any]:
 
 
 # ----------------------------
-# News (Google News RSS) + SEC links (simple)
+# News (Google News RSS)
 # ----------------------------
 def parse_rss_items(xml_text: str) -> List[Dict[str, Any]]:
     try:
@@ -628,7 +678,6 @@ def edgar_search_link(ticker: str) -> str:
 SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 
-# XBRL concepts (best-effort)
 CFO_CONCEPTS = [
     "NetCashProvidedByUsedInOperatingActivities",
     "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
@@ -645,10 +694,6 @@ SHARES_CONCEPTS = [
 
 
 async def get_sec_ticker_map(state: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Returns {TICKER: CIK(10 digits)}
-    Cached in state for 7 days to reduce load.
-    """
     now = time.time()
     cache = state.get("sec_ticker_map") or {}
     meta = state.get("sec_ticker_map_meta") or {}
@@ -666,7 +711,6 @@ async def get_sec_ticker_map(state: Dict[str, Any]) -> Dict[str, str]:
         data = r.json()
 
     out: Dict[str, str] = {}
-    # This file is a list of objects with fields like cik, ticker
     if isinstance(data, list):
         for row in data:
             if not isinstance(row, dict):
@@ -684,10 +728,6 @@ async def get_sec_ticker_map(state: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _pick_latest_quarters(facts: Dict[str, Any], concept_names: List[str]) -> List[float]:
-    """
-    Extracts latest quarterly USD values (best-effort) for given XBRL concepts.
-    Returns list newest->older.
-    """
     try:
         usgaap = facts.get("facts", {}).get("us-gaap", {})
     except Exception:
@@ -701,7 +741,6 @@ def _pick_latest_quarters(facts: Dict[str, Any], concept_names: List[str]) -> Li
     if not series:
         return []
 
-    # Units: prefer USD
     units = series.get("units") or {}
     candidates = units.get("USD") or units.get("usd") or []
     if not isinstance(candidates, list):
@@ -709,7 +748,6 @@ def _pick_latest_quarters(facts: Dict[str, Any], concept_names: List[str]) -> Li
 
     vals = []
     for x in candidates:
-        # We want quarterly-ish values; SEC uses 'fp' and 'form'
         if not isinstance(x, dict):
             continue
         v = x.get("val")
@@ -717,10 +755,8 @@ def _pick_latest_quarters(facts: Dict[str, Any], concept_names: List[str]) -> Li
             continue
         form = (x.get("form") or "").upper()
         fp = (x.get("fp") or "").upper()
-        # Use 10-Q primarily, allow 10-K too
         if form not in ("10-Q", "10-K"):
             continue
-        # Try to keep quarterly items; fp like Q1/Q2/Q3/Q4/FY
         if fp and fp not in ("Q1", "Q2", "Q3", "Q4", "FY"):
             continue
         try:
@@ -728,10 +764,8 @@ def _pick_latest_quarters(facts: Dict[str, Any], concept_names: List[str]) -> Li
         except Exception:
             continue
 
-    # sort by end date desc
     vals.sort(key=lambda z: z[0], reverse=True)
-    out = [v for _, v in vals[:8]]  # keep a handful
-    return out
+    return [v for _, v in vals[:8]]
 
 
 def _pick_latest_shares(facts: Dict[str, Any]) -> List[float]:
@@ -782,20 +816,10 @@ async def fetch_sec_companyfacts(client: httpx.AsyncClient, cik10: str) -> Optio
 
 
 def compute_fundamentals_from_facts(facts: Dict[str, Any], last_price: Optional[float]) -> Dict[str, Any]:
-    """
-    Free + best-effort:
-    - TTM CFO: sum latest 4 quarterly CFO values (approx)
-    - TTM Capex: sum latest 4 quarterly capex values (approx)
-    - FCF = CFO - Capex
-    - Shares latest and 1Y-ish ago to estimate dilution
-    - Market cap approx = last_price * shares
-    - FCF yield approx = FCF / market cap
-    """
     cfo_q = _pick_latest_quarters(facts, CFO_CONCEPTS)
     capex_q = _pick_latest_quarters(facts, CAPEX_CONCEPTS)
     shares = _pick_latest_shares(facts)
 
-    # approximate TTM by summing 4 newest values if present
     ttm_cfo = sum(cfo_q[:4]) if len(cfo_q) >= 4 else None
     ttm_capex = sum(capex_q[:4]) if len(capex_q) >= 4 else None
 
@@ -848,14 +872,9 @@ def fundamentals_compact(f: Dict[str, Any]) -> str:
 # Energy universe builders (free)
 # ----------------------------
 STOCKANALYSIS_ENERGY_URL = "https://stockanalysis.com/stocks/sector/energy/"
-GLOBALX_URA_CSV = "https://www.globalxetfs.com/funds/ura/?download=holdings"  # their page links to full holdings CSV
+GLOBALX_URA_CSV = "https://www.globalxetfs.com/funds/ura/?download=holdings"
 
 def parse_stockanalysis_energy_tickers(html: str, limit: int) -> List[str]:
-    """
-    Best-effort: extract tickers from the energy sector table.
-    The page includes many occurrences of symbols; we target patterns like:
-      href="/stocks/xom/" and capture xom
-    """
     syms = re.findall(r'href="/stocks/([a-z0-9\.\-]+)/"', html, flags=re.I)
     out = []
     seen = set()
@@ -878,9 +897,6 @@ async def fetch_energy_universe_stockanalysis(client: httpx.AsyncClient, limit: 
 
 
 def parse_csv_tickers(csv_text: str) -> List[str]:
-    """
-    Extract 'Ticker' column values from a CSV.
-    """
     lines = [ln.strip() for ln in csv_text.splitlines() if ln.strip()]
     if not lines:
         return []
@@ -903,7 +919,6 @@ def parse_csv_tickers(csv_text: str) -> List[str]:
 
 
 async def fetch_ura_holdings_tickers(client: httpx.AsyncClient) -> List[str]:
-    # Global X provides "Full Holdings (.csv)" on the page; the download param above often works.
     r = await client.get(GLOBALX_URA_CSV, headers={"user-agent": DEFAULT_UA, "accept": "text/csv,*/*"})
     if r.status_code != 200:
         return []
@@ -911,13 +926,6 @@ async def fetch_ura_holdings_tickers(client: httpx.AsyncClient) -> List[str]:
 
 
 async def build_energy_universe(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Returns dict with:
-      tickers: list[str]
-      sources: list[str]
-      meta: dict
-    Cached in state for 7 days.
-    """
     now = time.time()
     cache = state.get("energy_universe_cache") or {}
     meta = cache.get("meta") or {}
@@ -943,7 +951,6 @@ async def build_energy_universe(state: Dict[str, Any]) -> Dict[str, Any]:
 
     tickers.extend(ENERGY_UNIVERSE_EXTRA)
 
-    # normalize + dedupe + drop refiners
     out = []
     seen = set()
     for t in tickers:
@@ -966,20 +973,12 @@ async def build_energy_universe(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Energy scanner scoring (simple but thesis-aligned)
+# Energy scanner scoring
 # ----------------------------
 def score_candidate(ticker: str, tech: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Thesis-aligned v1 score.
-    - Must: Liq OK (else big penalty)
-    - Prefer: positive/OK FCF yield
-    - Penalize: dilution
-    - Prefer: above 200DMA for "core stability"; below = more "satellite/entry"
-    """
     liq = tech.get("liq") or "NA"
-    trend = tech.get("trend_vs_200")  # above/below/None
+    trend = tech.get("trend_vs_200")
     rsi = tech.get("rsi14")
-    mret = tech.get("mret_1m_pct")
 
     fy = fund.get("fcf_yield_pct")
     dil = fund.get("dilution_yoy_pct")
@@ -987,7 +986,6 @@ def score_candidate(ticker: str, tech: Dict[str, Any], fund: Dict[str, Any]) -> 
     score = 50.0
     tags = []
 
-    # Liquidity is non-negotiable for a scanner
     if liq == "OK":
         score += 10
         tags.append("Liq OK")
@@ -998,7 +996,6 @@ def score_candidate(ticker: str, tech: Dict[str, Any], fund: Dict[str, Any]) -> 
         score -= 10
         tags.append("Liq NA")
 
-    # FCF yield (core of your thesis)
     if fy is None or not math.isfinite(fy):
         score -= 5
         tags.append("FCF NA")
@@ -1019,7 +1016,6 @@ def score_candidate(ticker: str, tech: Dict[str, Any], fund: Dict[str, Any]) -> 
             score -= 15
             tags.append("FCF negative")
 
-    # Dilution (discipline)
     if dil is None or not math.isfinite(dil):
         tags.append("Shares NA")
     else:
@@ -1030,10 +1026,9 @@ def score_candidate(ticker: str, tech: Dict[str, Any], fund: Dict[str, Any]) -> 
             score += 2
             tags.append("No dilution")
         else:
-            score -= min(15, dil)  # cap penalty
+            score -= min(15, dil)
             tags.append("Dilution risk")
 
-    # Trend (stability vs entry)
     if trend == "above":
         score += 6
         tags.append("Above 200DMA")
@@ -1041,7 +1036,6 @@ def score_candidate(ticker: str, tech: Dict[str, Any], fund: Dict[str, Any]) -> 
         score -= 6
         tags.append("Below 200DMA")
 
-    # RSI (entry flag)
     entry_flag = ""
     if rsi is not None and math.isfinite(rsi):
         if rsi <= 30:
@@ -1051,14 +1045,12 @@ def score_candidate(ticker: str, tech: Dict[str, Any], fund: Dict[str, Any]) -> 
             entry_flag = "Overbought"
             tags.append("RSI>70")
 
-    # Bucket logic
     bucket = "Satellite"
     if (liq == "OK") and (fy is not None and math.isfinite(fy) and fy >= 8) and (dil is None or dil <= 2):
         bucket = "Core"
     if liq == "LOW" or (fy is not None and math.isfinite(fy) and fy < 0) or (ticker in REFINER_EXCLUDE):
         bucket = "Avoid"
 
-    # clamp
     score = max(0.0, min(100.0, score))
 
     return {
@@ -1073,22 +1065,12 @@ def score_candidate(ticker: str, tech: Dict[str, Any], fund: Dict[str, Any]) -> 
 
 
 async def run_energy_scan(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    - Build universe
-    - Limit scan size for stability (ENERGY_SCAN_MAX)
-    - Compute tech for all
-    - Pull SEC fundamentals (US-first) for those with CIK map
-    - Rank and cache results
-    """
     uni = await build_energy_universe(state)
-    universe = uni.get("tickers") or []
-    universe = universe[: max(10, ENERGY_SCAN_MAX)]
+    universe = (uni.get("tickers") or [])[: max(10, ENERGY_SCAN_MAX)]
 
-    # Compute tech (fast, free-ish)
     tech_cache = await compute_tech_cache(universe)
 
-    # SEC ticker map (US-first)
-    sec_map = await get_sec_ticker_map(state)  # {TICKER: CIK10}
+    sec_map = await get_sec_ticker_map(state)
 
     sem = asyncio.Semaphore(CONCURRENCY)
     fund_cache: Dict[str, Any] = {}
@@ -1113,14 +1095,12 @@ async def run_energy_scan(state: Dict[str, Any]) -> Dict[str, Any]:
 
         await asyncio.gather(*(do_one(t) for t in universe))
 
-    # Score
     rows = []
     for t in universe:
         tech = tech_cache.get(t) or {"compact": "Tech NA", "liq": "NA"}
         fund = fund_cache.get(t) or {"note": "Fund NA"}
         rows.append(score_candidate(t, tech, fund))
 
-    # Sort: Core first, then score desc
     bucket_rank = {"Core": 0, "Satellite": 1, "Avoid": 2}
     rows.sort(key=lambda r: (bucket_rank.get(r.get("bucket"), 9), -float(r.get("score") or 0.0), r.get("ticker") or ""))
 
@@ -1183,8 +1163,6 @@ async def dashboard(sort: str = "weight", dir: str = "desc"):
     tech_cache = state.get("tech_cache") or {}
 
     positions = state.get("positions") or []
-    groups = state.get("groups") or {}
-    crypto_rows = state.get("crypto_rows") or []
 
     sort_by = (sort or "weight").lower()
     direction = (dir or "desc").lower()
@@ -1209,7 +1187,7 @@ async def dashboard(sort: str = "weight", dir: str = "desc"):
             return "neg"
         return "flat"
 
-    def render_table(rows: List[Dict[str, Any]], is_crypto: bool = False) -> str:
+    def render_table(rows: List[Dict[str, Any]]) -> str:
         if not rows:
             return "<div class='muted'>No positions.</div>"
 
@@ -1271,7 +1249,6 @@ async def dashboard(sort: str = "weight", dir: str = "desc"):
         out.append("</tbody></table>")
         return "".join(out)
 
-    # Energy scan summary
     scan = state.get("energy_scan") or {}
     scan_date = scan.get("date")
     scan_top = scan.get("top") or []
@@ -1281,17 +1258,17 @@ async def dashboard(sort: str = "weight", dir: str = "desc"):
         out.append("<table><thead><tr>"
                    "<th>Ticker</th><th>Bucket</th><th>Score</th><th>Fundamentals</th><th>Tech</th>"
                    "</tr></thead><tbody>")
-        for r in scan_top[:25]:
-            t = r.get("ticker")
-            bucket = r.get("bucket")
-            score = r.get("score")
-            fund = r.get("fund") or {}
-            tech = r.get("tech") or {}
+        for rr in scan_top[:25]:
+            tt = rr.get("ticker")
+            bucket = rr.get("bucket")
+            score = rr.get("score")
+            fund = rr.get("fund") or {}
+            tech = rr.get("tech") or {}
             fline = fund.get("compact") or fund.get("note") or "Fund NA"
             tline = tech.get("compact") or "Tech NA"
             out.append(
                 "<tr>"
-                f"<td><a href='/t/{html_escape(t)}' target='_blank' rel='noopener noreferrer'>{html_escape(t)}</a></td>"
+                f"<td><a href='/t/{html_escape(tt)}' target='_blank' rel='noopener noreferrer'>{html_escape(tt)}</a></td>"
                 f"<td>{html_escape(bucket)}</td>"
                 f"<td>{html_escape(str(score))}</td>"
                 f"<td class='muted' style='font-size:12px;'>{html_escape(fline)}</td>"
@@ -1525,7 +1502,6 @@ async def ticker_page(ticker: str):
 async def run_daily():
     state = load_state()
 
-    # Fetch portfolio
     try:
         payload = await etoro_get_real_pnl()
         raw_positions = extract_positions(payload)
@@ -1546,11 +1522,19 @@ async def run_daily():
 
     portfolio_rows = build_portfolio_rows(agg_positions, ticker_map)
 
-    # Compute tech for portfolio tickers (and cache)
-    tickers = sorted({r["ticker"] for r in portfolio_rows if r.get("ticker")})
-    tech_cache = await compute_tech_cache(tickers)
+    # Build exchange_map for tech fetch (THIS is what fixes EQT on Stooq)
+    instrument_meta = map_debug.get("instrument_meta") or {}
+    exchange_map: Dict[str, str] = {}
+    for r in portfolio_rows:
+        iid = str(r.get("instrumentID") or "")
+        t = r.get("ticker") or ""
+        ex = (instrument_meta.get(iid) or {}).get("exchange", "")
+        if t and ex:
+            exchange_map[t] = ex
 
-    # Cache news only for portfolio tickers
+    tickers = sorted({r["ticker"] for r in portfolio_rows if r.get("ticker")})
+    tech_cache = await compute_tech_cache(tickers, exchange_map=exchange_map)
+
     news_cache = await compute_news(tickers)
 
     state.update({
@@ -1559,10 +1543,11 @@ async def run_daily():
         "stats": stats,
         "mapping": {"requested": map_debug.get("requested"), "mapped": map_debug.get("mapped")},
         "mapping_last_debug": map_debug,
-        "instrument_meta": map_debug.get("instrument_meta") or {},
+        "instrument_meta": instrument_meta,
         "tech_cache": tech_cache,
         "news_cache": news_cache,
         "energy_thesis": ENERGY_THESIS,
+        "exchange_map": exchange_map,
     })
     save_state(state)
 
@@ -1573,15 +1558,13 @@ async def run_daily():
         "mapped_symbols": map_debug.get("mapped"),
         "portfolio_tickers": len(tickers),
         "news_total": sum(len(v) for v in news_cache.values()),
+        "note": "Stooq tech now tries TICKER.US first for US exchanges (fixes EQT).",
     }
 
 
 @app.get("/tasks/scan-energy")
 async def task_scan_energy():
     state = load_state()
-    if not SEC_UA:
-        # Still run tech-only scan, but warn that fundamentals will be NA
-        pass
     res = await run_energy_scan(state)
     return {
         "status": "ok",
@@ -1604,3 +1587,26 @@ async def api_scanner():
 async def debug_mapping_last():
     state = load_state()
     return JSONResponse(state.get("mapping_last_debug") or {"note": "Run /tasks/daily first."})
+
+
+@app.get("/debug/tech/{ticker}")
+async def debug_tech_ticker(ticker: str):
+    """
+    Quick sanity check: shows which Stooq symbols were tried for this ticker and whether it worked.
+    """
+    t = normalize_ticker(ticker)
+    state = load_state()
+    ex = (state.get("exchange_map") or {}).get(t, "")
+    tried = _stooq_symbol_candidates(t, ex)
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+        bars = await fetch_stooq_daily(client, t, ex)
+
+    return {
+        "ticker": t,
+        "exchange_hint": ex,
+        "stooq_candidates_tried": tried,
+        "bars_len": len(bars),
+        "ok": bool(bars),
+        "tip": "If ok=false for a US stock, Stooq might be down or rate-limiting; add a Yahoo fallback later.",
+    }
