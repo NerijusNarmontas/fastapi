@@ -1,21 +1,28 @@
 # main.py
-# Paste this as your ONLY main.py.
-# Railway startCommand should be: hypercorn main:app --bind "0.0.0.0:$PORT"
+# Full single-file FastAPI app:
+# - Pulls your CURRENT eToro positions tickers (stocks only; crypto collisions excluded)
+# - Caches tickers into STATE["tickers"]
+# - Fetches News links (Google News RSS) + SEC filings links (EDGAR; CIK optional)
+# - Shows everything on /
 #
-# What you MUST set in Railway Variables:
-#   TICKERS = EQT,CIVI,DVN,SM,NOG,CCJ,LEU,SMR,OKLO,EPD,WMB,... (your stocks)
+# Railway startCommand:
+#   hypercorn main:app --bind "0.0.0.0:$PORT"
+#
+# Railway Variables you should set:
+#   ETORO_API_KEY=...
+#   ETORO_USER_KEY=...
 # Optional:
-#   CRYPTO_EXCLUDE = W (comma-separated tickers you want to ignore)
-#   NEWS_PER_TICKER = 6
-#   SEC_PER_TICKER = 6
-#   SEC_UA = "YourName AppName (email@domain.com)"   # important for SEC
-#   DEFAULT_UA = "...browser UA..."                  # helps Google News RSS
-#   CIK_MAP = {"AAPL":"0000320193","MSFT":"0000789019"}  # optional for richer SEC per ticker
+#   CRYPTO_EXCLUDE=W
+#   DEFAULT_UA=Mozilla/5.0 ...
+#   SEC_UA=YourName AppName (email@domain.com)
+#   CIK_MAP={"AAPL":"0000320193","MSFT":"0000789019"}   # optional for richer SEC per ticker
+# If eToro endpoint differs for your setup, override:
+#   ETORO_POSITIONS_URL=https://api.etorostatic.com/sapi/trading/positions/
 #
-# After deploy:
-#   1) open /tasks/daily once
-#   2) open /  (dashboard)
-#   3) open /api/news if you want raw JSON
+# Usage:
+#   1) Deploy
+#   2) Open /tasks/daily once
+#   3) Open /
 
 import os
 import re
@@ -31,34 +38,51 @@ import httpx
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
+
+# ----------------------------
+# Config
+# ----------------------------
+
 APP_NAME = "Investing Dashboard"
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/investing_agent_state.json")
 
-# --- Core inputs ---
-TICKERS_ENV = os.getenv("TICKERS", "").strip()
-CRYPTO_EXCLUDE = set(
-    s.strip().upper() for s in os.getenv("CRYPTO_EXCLUDE", "W").split(",") if s.strip()
-)
-
-# --- Limits / perf ---
-NEWS_PER_TICKER = int(os.getenv("NEWS_PER_TICKER", "6"))
-SEC_PER_TICKER = int(os.getenv("SEC_PER_TICKER", "6"))
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "25"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "10"))
 
-# --- User-Agent headers (important) ---
+NEWS_PER_TICKER = int(os.getenv("NEWS_PER_TICKER", "6"))
+SEC_PER_TICKER = int(os.getenv("SEC_PER_TICKER", "6"))
+
 DEFAULT_UA = os.getenv(
     "DEFAULT_UA",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
 )
+
 SEC_UA = os.getenv(
     "SEC_UA",
     "NerijusNarmontas fastapi-investing-dashboard (contact: nerijus@example.com)",
 )
 
+CRYPTO_EXCLUDE = set(
+    s.strip().upper() for s in os.getenv("CRYPTO_EXCLUDE", "W").split(",") if s.strip()
+)
+
 CIK_MAP_JSON = os.getenv("CIK_MAP", "").strip()
 
+# eToro
+ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()
+ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip()
+
+# NOTE: you got a 301 earlier because of trailing slash / redirects.
+ETORO_POSITIONS_URL = os.getenv(
+    "ETORO_POSITIONS_URL",
+    "https://api.etorostatic.com/sapi/trading/positions/",
+).strip()
+
+
+# ----------------------------
+# State
+# ----------------------------
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -83,11 +107,15 @@ def save_state(state: Dict[str, Any]) -> None:
 
 STATE: Dict[str, Any] = load_state()
 STATE.setdefault("tickers", [])
-STATE.setdefault("news_cache", {})  # {ticker: [items]}
-STATE.setdefault("sec_cache", {})   # {ticker: [items]}
+STATE.setdefault("news_cache", {})
+STATE.setdefault("sec_cache", {})
 STATE.setdefault("last_run", None)
 STATE.setdefault("debug", {})
 
+
+# ----------------------------
+# Helpers
+# ----------------------------
 
 def normalize_ticker(t: str) -> str:
     t = (t or "").strip().upper()
@@ -108,6 +136,16 @@ def html_escape(s: str) -> str:
     )
 
 
+def dedupe(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in items:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
 def dedupe_by_key(items: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
     seen = set()
     out = []
@@ -120,6 +158,10 @@ def dedupe_by_key(items: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]
     return out
 
 
+# ----------------------------
+# RSS / Atom parsing
+# ----------------------------
+
 def parse_rss_or_atom(xml_text: str) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     try:
@@ -131,11 +173,12 @@ def parse_rss_or_atom(xml_text: str) -> List[Dict[str, Any]]:
     channel = root.find("channel")
     if channel is not None:
         for item in channel.findall("item"):
-            title = safe_text(item.findtext("title"))
-            link = safe_text(item.findtext("link"))
-            pub = safe_text(item.findtext("pubDate"))
-            source = safe_text(item.findtext("source"))
-            items.append({"title": title, "link": link, "published_raw": pub, "source": source})
+            items.append({
+                "title": safe_text(item.findtext("title")),
+                "link": safe_text(item.findtext("link")),
+                "published_raw": safe_text(item.findtext("pubDate")),
+                "source": safe_text(item.findtext("source")),
+            })
         return items
 
     # Atom: entry
@@ -149,6 +192,10 @@ def parse_rss_or_atom(xml_text: str) -> List[Dict[str, Any]]:
         items.append({"title": title, "link": link, "published_raw": updated, "source": ""})
     return items
 
+
+# ----------------------------
+# Resume heuristics (no full-text reading)
+# ----------------------------
 
 def resume_news(title: str) -> str:
     t = (title or "").lower()
@@ -193,6 +240,10 @@ def resume_sec(form: str, title: str) -> str:
     return "Filing update. Open link and skim cover + key sections."
 
 
+# ----------------------------
+# Data models
+# ----------------------------
+
 @dataclass
 class NewsItem:
     ticker: str
@@ -213,31 +264,85 @@ class SecItem:
     resume: str
 
 
-def get_tickers() -> List[str]:
-    base: List[str] = []
-    # Prefer STATE tickers if already populated
-    if isinstance(STATE.get("tickers"), list) and STATE["tickers"]:
-        base = [normalize_ticker(x) for x in STATE["tickers"]]
-    elif TICKERS_ENV:
-        base = [normalize_ticker(x) for x in TICKERS_ENV.split(",")]
+# ----------------------------
+# eToro tickers (stocks only)
+# ----------------------------
 
-    out: List[str] = []
-    for t in base:
-        if not t:
-            continue
-        if t in CRYPTO_EXCLUDE:
-            continue
-        out.append(t)
+def build_etoro_headers() -> Dict[str, str]:
+    # Header names can vary depending on your earlier working code.
+    # This is a conservative set; adjust if your old code used different names.
+    h = {
+        "accept": "application/json",
+        "user-agent": DEFAULT_UA,
+    }
+    if ETORO_API_KEY:
+        h["authorization"] = f"Bearer {ETORO_API_KEY}"
+    if ETORO_USER_KEY:
+        h["x-etoro-user-key"] = ETORO_USER_KEY
+    return h
 
-    # de-dupe stable
-    seen = set()
-    uniq = []
-    for t in out:
-        if t not in seen:
-            uniq.append(t)
-            seen.add(t)
-    return uniq
 
+def extract_tickers_from_positions_json(data: Any) -> List[str]:
+    """
+    Tries to extract tickers from whatever shape eToro returns.
+    If your payload doesn't contain 'symbol'/'ticker' directly, you'll need your old instrumentID->ticker map.
+    """
+    positions: List[Dict[str, Any]] = []
+
+    if isinstance(data, list):
+        positions = data
+    elif isinstance(data, dict):
+        for k in ("positions", "data", "result", "items"):
+            v = data.get(k)
+            if isinstance(v, list):
+                positions = v
+                break
+
+    raw: List[str] = []
+    for p in positions:
+        sym = p.get("ticker") or p.get("symbol") or p.get("instrumentSymbol") or p.get("InstrumentSymbol")
+        if sym:
+            raw.append(normalize_ticker(str(sym)))
+
+    # filter crypto collisions
+    tickers = sorted({t for t in raw if t and t not in CRYPTO_EXCLUDE})
+    return tickers
+
+
+async def fetch_etoro_stock_tickers(client: httpx.AsyncClient) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    Returns (tickers, debug).
+    """
+    dbg: Dict[str, Any] = {"positions_url": ETORO_POSITIONS_URL}
+    if not ETORO_API_KEY or not ETORO_USER_KEY:
+        dbg["error"] = "Missing ETORO_API_KEY or ETORO_USER_KEY"
+        return [], dbg
+
+    headers = build_etoro_headers()
+
+    try:
+        r = await client.get(ETORO_POSITIONS_URL, headers=headers)
+        dbg["status_code"] = r.status_code
+        if r.status_code != 200:
+            dbg["body_head"] = r.text[:300]
+            return [], dbg
+        data = r.json()
+    except Exception as e:
+        dbg["error"] = f"{type(e).__name__}: {e}"
+        return [], dbg
+
+    tickers = extract_tickers_from_positions_json(data)
+    dbg["extracted"] = len(tickers)
+    if tickers:
+        dbg["sample"] = tickers[:10]
+    else:
+        dbg["note"] = "No tickers extracted. Your positions JSON may not include symbol/ticker fields; you may need instrumentID->ticker mapping from your older code."
+    return tickers, dbg
+
+
+# ----------------------------
+# News + SEC fetch
+# ----------------------------
 
 async def fetch_google_news_rss(client: httpx.AsyncClient, ticker: str) -> List[NewsItem]:
     q = quote_plus(f"{ticker} stock")
@@ -268,8 +373,8 @@ async def fetch_google_news_rss(client: httpx.AsyncClient, ticker: str) -> List[
                 resume=resume_news(title),
             )
         )
-    dedup = dedupe_by_key([x.__dict__ for x in out], "link")
-    return [NewsItem(**x) for x in dedup[:NEWS_PER_TICKER]]
+    deduped = dedupe_by_key([x.__dict__ for x in out], "link")
+    return [NewsItem(**x) for x in deduped[:NEWS_PER_TICKER]]
 
 
 async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[SecItem]:
@@ -323,10 +428,10 @@ async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[S
                     resume=resume_sec(form or "", title),
                 )
             )
-        dedup = dedupe_by_key([x.__dict__ for x in out], "link")
-        return [SecItem(**x) for x in dedup[:SEC_PER_TICKER]]
+        deduped = dedupe_by_key([x.__dict__ for x in out], "link")
+        return [SecItem(**x) for x in deduped[:SEC_PER_TICKER]]
 
-    # fallback: still give you a clickable EDGAR search (no parsing)
+    # fallback: always give a clickable EDGAR search
     search_link = f"https://www.sec.gov/edgar/search/#/q={quote_plus(ticker)}&sort=desc"
     return [
         SecItem(
@@ -340,16 +445,37 @@ async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[S
     ]
 
 
+# ----------------------------
+# Daily refresh
+# ----------------------------
+
 async def run_daily_refresh() -> Dict[str, Any]:
-    tickers = get_tickers()
     started = now_utc_iso()
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    news_cache: Dict[str, Any] = {}
-    sec_cache: Dict[str, Any] = {}
     errors: List[str] = []
+    debug: Dict[str, Any] = {"started": started}
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=HTTP_TIMEOUT,
+        follow_redirects=True,  # FIX for your 301 redirect
+    ) as client:
+
+        # 1) Pull tickers from eToro
+        tickers, et_dbg = await fetch_etoro_stock_tickers(client)
+        debug["etoro"] = et_dbg
+        if not tickers:
+            # keep existing tickers if present, but still report
+            tickers = [normalize_ticker(t) for t in (STATE.get("tickers") or [])]
+        tickers = [t for t in tickers if t and t not in CRYPTO_EXCLUDE]
+        tickers = dedupe(tickers)
+
+        # cache tickers
+        STATE["tickers"] = tickers
+
+        # 2) Fetch news + SEC
+        news_cache: Dict[str, Any] = {}
+        sec_cache: Dict[str, Any] = {}
 
         async def gn(t: str) -> Tuple[str, List[Dict[str, Any]]]:
             async with sem:
@@ -361,99 +487,44 @@ async def run_daily_refresh() -> Dict[str, Any]:
                 items = await fetch_sec_for_ticker(client, t)
                 return t, [x.__dict__ for x in items]
 
-        # run
-        tasks_news = [gn(t) for t in tickers]
-        tasks_sec = [sec(t) for t in tickers]
-
         try:
-            news_results = await asyncio.gather(*tasks_news)
+            news_results = await asyncio.gather(*[gn(t) for t in tickers])
         except Exception as e:
             news_results = []
-            errors.append(f"news_gather: {type(e).__name__}")
+            errors.append(f"news_gather: {type(e).__name__}: {e}")
 
         try:
-            sec_results = await asyncio.gather(*tasks_sec)
+            sec_results = await asyncio.gather(*[sec(t) for t in tickers])
         except Exception as e:
             sec_results = []
-            errors.append(f"sec_gather: {type(e).__name__}")
+            errors.append(f"sec_gather: {type(e).__name__}: {e}")
 
     for t, items in news_results:
         news_cache[t] = items
-
     for t, items in sec_results:
         sec_cache[t] = items
 
-    STATE["tickers"] = tickers
     STATE["news_cache"] = news_cache
     STATE["sec_cache"] = sec_cache
     STATE["last_run"] = started
     STATE["debug"] = {
         "started": started,
-        "tickers": len(tickers),
+        "tickers": len(STATE["tickers"]),
         "news_total": sum(len(v) for v in news_cache.values()),
         "sec_total": sum(len(v) for v in sec_cache.values()),
         "errors": errors[:50],
-        "note": "If tickers=0, set Railway env var TICKERS.",
+        "note": "If extracted tickers=0, your eToro positions JSON likely lacks symbol/ticker fields. Then you must restore instrumentID->ticker mapping from your older code.",
+        "etoro_debug": debug.get("etoro", {}),
     }
     save_state(STATE)
     return STATE["debug"]
 
 
+# ----------------------------
+# FastAPI app
+# ----------------------------
+
 app = FastAPI(title=APP_NAME)
-import os
-import httpx
-from fastapi.responses import PlainTextResponse
-
-ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()
-ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip()
-
-# If you already had these in your old code, keep the same endpoints you used.
-ETORO_POSITIONS_URL = os.getenv(
-    "ETORO_POSITIONS_URL",
-    "https://api.etorostatic.com/sapi/trading/positions",  # placeholder: use YOUR working endpoint
-)
-
-@app.get("/debug/tickers", response_class=PlainTextResponse)
-async def debug_tickers() -> str:
-    """
-    Returns: comma-separated STOCK tickers (crypto excluded) ready for Railway TICKERS env var.
-    This uses the same idea as before: fetch positions -> map to symbols -> filter crypto collisions.
-    """
-    if not ETORO_API_KEY or not ETORO_USER_KEY:
-        return "Missing ETORO_API_KEY / ETORO_USER_KEY in env."
-
-    headers = {
-        "accept": "application/json",
-        "user-agent": DEFAULT_UA,
-        "authorization": f"Bearer {ETORO_API_KEY}",
-        "x-etoro-user-key": ETORO_USER_KEY,
-    }
-
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(ETORO_POSITIONS_URL, headers=headers)
-        if r.status_code != 200:
-            return f"eToro positions fetch failed: {r.status_code}\n{r.text[:300]}"
-
-        data = r.json()
-
-    # ---- YOU MUST ADAPT THIS PART to your actual eToro JSON shape ----
-    # In your earlier logs you had "instrumentID" and later you mapped to "ticker".
-    # If your JSON already contains symbol/ticker, prefer that.
-    positions = data if isinstance(data, list) else data.get("positions") or data.get("data") or []
-
-    raw_symbols = []
-    for p in positions:
-        sym = p.get("ticker") or p.get("symbol")
-        if sym:
-            raw_symbols.append(normalize_ticker(sym))
-
-    # If you don't have symbol/ticker in positions, you need the instrumentID->ticker map like before.
-    # (That part depends on your existing mapping code / endpoint you already had.)
-
-    # crypto collisions exclude (e.g. W)
-    tickers = sorted({s for s in raw_symbols if s and s not in CRYPTO_EXCLUDE})
-
-    return ",".join(tickers)
 
 
 @app.get("/health", response_class=PlainTextResponse)
@@ -469,22 +540,27 @@ async def tasks_daily() -> Dict[str, Any]:
 
 @app.get("/api/news", response_class=JSONResponse)
 def api_news(ticker: Optional[str] = None) -> Dict[str, Any]:
-    tickers = get_tickers()
     cache = STATE.get("news_cache", {}) or {}
     if ticker:
         t = normalize_ticker(ticker)
         return {"ticker": t, "items": cache.get(t, []), "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
-    return {"tickers": tickers, "news_cache": cache, "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
+    return {"tickers": STATE.get("tickers", []), "news_cache": cache, "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
 
 
 @app.get("/api/sec", response_class=JSONResponse)
 def api_sec(ticker: Optional[str] = None) -> Dict[str, Any]:
-    tickers = get_tickers()
     cache = STATE.get("sec_cache", {}) or {}
     if ticker:
         t = normalize_ticker(ticker)
         return {"ticker": t, "items": cache.get(t, []), "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
-    return {"tickers": tickers, "sec_cache": cache, "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
+    return {"tickers": STATE.get("tickers", []), "sec_cache": cache, "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
+
+
+@app.get("/debug/tickers", response_class=PlainTextResponse)
+def debug_tickers() -> str:
+    # prints current cached tickers ready for env paste
+    tickers = STATE.get("tickers", []) or []
+    return ",".join(tickers)
 
 
 def render_ticker_card(t: str) -> str:
@@ -556,8 +632,8 @@ def render_ticker_card(t: str) -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard(limit: int = Query(60, ge=1, le=500)) -> str:
-    tickers = get_tickers()[:limit]
+def dashboard(limit: int = Query(80, ge=1, le=500)) -> str:
+    tickers = (STATE.get("tickers") or [])[:limit]
     last_run = STATE.get("last_run") or "never"
     dbg = STATE.get("debug", {}) or {}
 
@@ -565,8 +641,8 @@ def dashboard(limit: int = Query(60, ge=1, le=500)) -> str:
         body = """
         <div class="card">
           <div class="muted">
-            No tickers found.<br/>
-            Set Railway Variable <code>TICKERS</code> like: <code>EQT,SM,CCJ,LEU</code><br/>
+            No tickers cached.<br/>
+            Ensure Railway Variables <code>ETORO_API_KEY</code> and <code>ETORO_USER_KEY</code> are set.<br/>
             Then run <code>/tasks/daily</code>.
           </div>
         </div>
@@ -604,6 +680,8 @@ def dashboard(limit: int = Query(60, ge=1, le=500)) -> str:
     .resume {{ font-size: 12px; margin-top: 6px; color: #c6d2dd; }}
     code {{ background: #0b111a; border: 1px solid #1f2a37; padding: 2px 6px; border-radius: 8px; color: #cfe2ff; }}
     .badge {{ display:inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid #314055; color: #cfe2ff; margin-right: 6px; }}
+    details {{ margin-top: 10px; }}
+    pre {{ white-space: pre-wrap; word-break: break-word; background:#0b111a; border:1px solid #1f2a37; padding:10px; border-radius:12px; color:#9fb0c0; font-size:12px; }}
   </style>
 </head>
 <body>
@@ -617,6 +695,7 @@ def dashboard(limit: int = Query(60, ge=1, le=500)) -> str:
         <span class="pill"><a href="/tasks/daily" target="_blank" rel="noopener noreferrer">Run /tasks/daily</a></span>
         <span class="pill"><a href="/api/news" target="_blank" rel="noopener noreferrer">/api/news</a></span>
         <span class="pill"><a href="/api/sec" target="_blank" rel="noopener noreferrer">/api/sec</a></span>
+        <span class="pill"><a href="/debug/tickers" target="_blank" rel="noopener noreferrer">/debug/tickers</a></span>
       </div>
     </div>
 
@@ -626,8 +705,13 @@ def dashboard(limit: int = Query(60, ge=1, le=500)) -> str:
 
     {body}
 
+    <details>
+      <summary class="meta">Debug details (eToro extraction + errors)</summary>
+      <pre>{html_escape(json.dumps(dbg, ensure_ascii=False, indent=2))}</pre>
+    </details>
+
     <div class="meta" style="margin-top:18px;">
-      If SEC looks too thin: set <code>CIK_MAP</code> (ticker→CIK). SEC also needs <code>SEC_UA</code>.
+      SEC richer mode: set <code>CIK_MAP</code> (ticker→CIK). SEC also needs <code>SEC_UA</code>.
     </div>
   </div>
 </body>
@@ -635,4 +719,4 @@ def dashboard(limit: int = Query(60, ge=1, le=500)) -> str:
 """
 
 
-# End of file.
+# End.
