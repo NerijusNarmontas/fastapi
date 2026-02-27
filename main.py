@@ -1,29 +1,36 @@
 # main.py
-# Changes based on your feedback:
-# ✅ Adds your manual classifications:
-#   - Crypto: SEI WLD PYTH HBAR CRO HYPE RPL ARBE (+ your existing CRYPTO_TICKERS)
-#   - Energy: CEG (Energy)
-#   - Space: BKSY FLY SPIR (Space / Space tech)
-#   - Rare metals: ABAT USAR TMC (Rare metals)
-#   - Nuclear: FERMI LTBR BOE.ASX (Nuclear)
-#   - Tech: CRWV S.US INTC (Tech)
-#   - Quantum: ARQQ RGTI (Quantum)
-#   - Miners: RGLD (Miners)
+# Single-file FastAPI app that:
+# - Pulls eToro REAL PnL + portfolio positions
+# - Aggregates by instrumentID
+# - Maps instrumentID -> ticker via eToro /market-data/search
+# - Separates Crypto vs Stocks
+# - Categorizes stocks into industry-like groups
+# - CLEAN dashboard (tables only; no bulky news blocks)
+# - News/SEC links shown ONLY when you click a ticker:
+#     /t/{TICKER} opens a new page with all cached links for that ticker
+# - Fetches FREE news links (Google News RSS) per ticker (cached by /tasks/daily)
+# - Adds SEC links + short “resume” bullets (cached by /tasks/daily)
 #
-# ✅ Cleaner UI:
-#   - White screen / black text
-#   - Category sections are COLLAPSIBLE (<details>)
-#   - Each category shows ONE compact table
-#   - News shown AFTER each category but compact:
-#       - one unified list (top headlines across tickers)
-#       - not separate huge cards per ticker
-#   - SEC shown as compact list (latest per category)
+# Railway startCommand:
+#   hypercorn main:app --bind "0.0.0.0:$PORT"
 #
-# ✅ Categories now behave more like "industries" (your “industry groups”) instead of broad sectors:
-#   - Energy / Gas / Nuclear / Space / Space Tech / Rare Metals / Miners / Tech / AI Infra / Quantum / Other
+# Railway Variables REQUIRED:
+#   ETORO_API_KEY=...
+#   ETORO_USER_KEY=...
+#   SEC_UA=YourName AppName (email@domain.com)
 #
-# NOTE: OpenAI/Gemini brief remains optional; you can disable by not setting OPENAI_API_KEY.
-#       (If you later swap to Gemini, only the brief function changes.)
+# Optional:
+#   OPENAI_API_KEY=... (optional AI brief; safe to leave empty)
+#   CRYPTO_EXCLUDE=W
+#   CRYPTO_TICKERS=BTC,ETH,... (extend list)
+#   CRYPTO_INSTRUMENT_IDS=100000
+#   STATE_PATH=/tmp/investing_agent_state.json
+#   NEWS_PER_TICKER=6
+#   SEC_PER_TICKER=6
+#   DEFAULT_UA=...
+#   ETORO_REAL_PNL_URL=...
+#   ETORO_SEARCH_URL=...
+#   CIK_MAP={"AAPL":"0000320193"}  # optional for richer SEC lists (CIK-based Atom feed)
 
 import os
 import re
@@ -74,12 +81,12 @@ DEFAULT_UA = os.getenv(
 SEC_UA = os.getenv("SEC_UA", "").strip()
 CIK_MAP_JSON = os.getenv("CIK_MAP", "").strip()
 
-# "Collision excludes" (kept)
+# kept: ticker collision excludes (default W)
 CRYPTO_EXCLUDE = set(
     s.strip().upper() for s in os.getenv("CRYPTO_EXCLUDE", "W").split(",") if s.strip()
 )
 
-# crypto list (you can extend via env)
+# crypto list (your list + extendable via env)
 CRYPTO_TICKERS = set(
     s.strip().upper()
     for s in os.getenv(
@@ -89,6 +96,7 @@ CRYPTO_TICKERS = set(
     if s.strip()
 )
 
+# optional instrumentID heuristic for crypto (BTC on eToro often 100000)
 CRYPTO_INSTRUMENT_IDS = set(
     int(x.strip())
     for x in os.getenv("CRYPTO_INSTRUMENT_IDS", "100000").split(",")
@@ -98,19 +106,16 @@ CRYPTO_INSTRUMENT_IDS = set(
 NEWS_PER_TICKER = int(os.getenv("NEWS_PER_TICKER", "6"))
 SEC_PER_TICKER = int(os.getenv("SEC_PER_TICKER", "6"))
 
-# NEW: compact mode limits (reduce bulk)
-CATEGORY_MAX_TICKERS_FOR_NEWS = int(os.getenv("CATEGORY_MAX_TICKERS_FOR_NEWS", "10"))
-CATEGORY_MAX_NEWS_ITEMS = int(os.getenv("CATEGORY_MAX_NEWS_ITEMS", "12"))
-CATEGORY_MAX_SEC_ITEMS = int(os.getenv("CATEGORY_MAX_SEC_ITEMS", "10"))
-
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "25"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "10"))
 
 # ----------------------------
-# "Industry-like" categories (manual overrides first)
+# Industry-like categories (manual overrides first)
 # ----------------------------
-# Format: TICKER -> (IndustryGroup, SubGroup)
+# Your explicit mapping + core portfolio examples
 CATEGORY_OVERRIDES: Dict[str, Tuple[str, str]] = {
+    # Crypto are handled separately (not here)
+
     # Your explicit mapping
     "CEG": ("Energy", "Power / Nuclear-linked"),
     "BKSY": ("Space", "Earth Observation"),
@@ -130,7 +135,7 @@ CATEGORY_OVERRIDES: Dict[str, Tuple[str, str]] = {
     "ARQQ": ("Quantum", "Quantum / Security"),
     "RGTI": ("Quantum", "Quantum Computing"),
 
-    # Core energy portfolio examples (keep these so grouping stays clean)
+    # Energy / gas / midstream examples (keep grouping clean)
     "EQT": ("Gas", "Gas E&P"),
     "CTRA": ("Gas", "Gas E&P"),
     "RRC": ("Gas", "Gas E&P"),
@@ -151,14 +156,12 @@ CATEGORY_OVERRIDES: Dict[str, Tuple[str, str]] = {
     "OKLO": ("Nuclear", "SMR"),
 }
 
-# energy thesis (tracked, not printed)
 ENERGY_THESIS = {
     "focus": ["post-shale peak", "capital discipline", "FCF/ROIC", "gas tightness", "geopolitics", "nuclear buildout"],
     "avoid": ["refining"],
     "preferred": ["gas", "midstream", "uranium", "nuclear fuel", "smrs"],
 }
 
-# category order (clean)
 CATEGORY_ORDER = [
     "Gas",
     "Energy",
@@ -171,7 +174,6 @@ CATEGORY_ORDER = [
     "Rare Metals",
     "Miners",
     "Other",
-    "Crypto",
 ]
 
 # ----------------------------
@@ -312,13 +314,24 @@ def categorize_ticker(ticker: str) -> Tuple[str, str]:
         return ("Miners", "Miners")
     if t in ("ABAT", "USAR", "TMC", "ALB"):
         return ("Rare Metals", "Materials")
+    if t in ("INTC", "S.US"):
+        return ("Tech", "Semis / Chips")
     return ("Other", "Unclassified")
+
+
+def ordered_industries(groups: Dict[str, Any]) -> List[str]:
+    present = set(groups.keys())
+    out = [x for x in CATEGORY_ORDER if x in present]
+    for k in sorted(present):
+        if k not in out:
+            out.append(k)
+    return out
 
 
 def group_rows(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Returns:
-      groups: { "Industry": { "subgroups": {sub: [rows]}, "rows": [rows], "tickers": [...]} }
+      groups: { industry: {"rows":[...], "tickers":[...]} }
       crypto_rows: [rows]
     """
     groups: Dict[str, Dict[str, Any]] = {}
@@ -336,32 +349,19 @@ def group_rows(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], L
             crypto_rows.append(r)
             continue
 
-        industry, sub = categorize_ticker(t)
+        industry, _sub = categorize_ticker(t)
         if industry not in groups:
-            groups[industry] = {"subgroups": defaultdict(list), "rows": [], "tickers": []}
-        groups[industry]["subgroups"][sub].append(r)
+            groups[industry] = {"rows": [], "tickers": []}
         groups[industry]["rows"].append(r)
         if t:
             groups[industry]["tickers"].append(t)
 
-    # sort rows by weight desc
     for industry in groups:
         groups[industry]["rows"].sort(key=lambda x: float(x.get("weight_pct") or 0), reverse=True)
         groups[industry]["tickers"] = list(dict.fromkeys(groups[industry]["tickers"]))
 
     crypto_rows.sort(key=lambda x: float(x.get("weight_pct") or 0), reverse=True)
-
     return groups, crypto_rows
-
-
-def ordered_industries(groups: Dict[str, Any]) -> List[str]:
-    present = set(groups.keys())
-    out = [x for x in CATEGORY_ORDER if x in present]
-    # add any unknown at end
-    for k in sorted(present):
-        if k not in out:
-            out.append(k)
-    return out
 
 
 # ----------------------------
@@ -469,7 +469,7 @@ def build_portfolio_rows(agg: List[Dict[str, Any]], ticker_map: Dict[int, str]) 
         ticker_raw = ticker_map.get(iid) or str(iid)
         ticker = normalize_ticker(ticker_raw)
 
-        # Collision exclude for non-crypto only
+        # collision exclude for non-crypto only
         if ticker in CRYPTO_EXCLUDE and ticker not in CRYPTO_TICKERS:
             continue
 
@@ -658,7 +658,6 @@ async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[D
                 break
         return out
 
-    # fallback link
     search_link = f"https://www.sec.gov/edgar/search/#/q={quote_plus(ticker)}&sort=desc"
     return [{
         "ticker": ticker,
@@ -671,7 +670,7 @@ async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[D
 
 
 # ----------------------------
-# Optional OpenAI brief (keep as-is; you can disable by no key)
+# Optional OpenAI brief (disable by leaving OPENAI_API_KEY empty)
 # ----------------------------
 async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
     if not OPENAI_API_KEY:
@@ -704,7 +703,7 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
 
 
 # ----------------------------
-# Daily Task: eToro -> tickers -> news + sec
+# Daily Task: tickers -> news + sec
 # ----------------------------
 async def compute_news_and_sec(tickers: List[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     sem = asyncio.Semaphore(CONCURRENCY)
@@ -725,40 +724,6 @@ async def compute_news_and_sec(tickers: List[str]) -> Tuple[Dict[str, Any], Dict
         await asyncio.gather(*(do_sec(t) for t in tickers))
 
     return news_cache, sec_cache
-
-
-def _compact_merge_news(news_cache: Dict[str, List[Dict[str, Any]]], tickers: List[str], limit: int) -> List[Dict[str, Any]]:
-    """
-    Merge news across many tickers into one list, dedupe by link.
-    Keeps order by ticker order, then RSS order.
-    """
-    seen = set()
-    out: List[Dict[str, Any]] = []
-    for t in tickers:
-        for it in (news_cache.get(t) or []):
-            link = (it.get("link") or "").strip()
-            if not link or link in seen:
-                continue
-            seen.add(link)
-            out.append(it)
-            if len(out) >= limit:
-                return out
-    return out
-
-
-def _compact_merge_sec(sec_cache: Dict[str, List[Dict[str, Any]]], tickers: List[str], limit: int) -> List[Dict[str, Any]]:
-    seen = set()
-    out: List[Dict[str, Any]] = []
-    for t in tickers:
-        for it in (sec_cache.get(t) or []):
-            link = (it.get("link") or "").strip()
-            if not link or link in seen:
-                continue
-            seen.add(link)
-            out.append(it)
-            if len(out) >= limit:
-                return out
-    return out
 
 
 # ----------------------------
@@ -788,9 +753,6 @@ async def dashboard():
     groups = state.get("groups") or {}          # {industry: {"rows":[], "tickers":[]}}
     crypto_rows = state.get("crypto_rows") or []
 
-    news_cache = state.get("news_cache") or {}
-    sec_cache = state.get("sec_cache") or {}
-
     def bullets(items: List[str]) -> str:
         lis = "".join([f"<li>{html_escape(x)}</li>" for x in items]) if items else "<li>None</li>"
         return f"<ul>{lis}</ul>"
@@ -803,9 +765,10 @@ async def dashboard():
                    "<th>Ticker</th><th>Lots</th><th>Weight %</th><th>P&amp;L %</th>"
                    "</tr></thead><tbody>")
         for r in rows[:200]:
+            t = r.get("ticker", "")
             out.append(
                 "<tr>"
-                f"<td>{html_escape(r.get('ticker',''))}</td>"
+                f"<td><a href='/t/{html_escape(t)}' target='_blank' rel='noopener noreferrer'>{html_escape(t)}</a></td>"
                 f"<td>{html_escape(r.get('lots',''))}</td>"
                 f"<td>{html_escape(r.get('weight_pct',''))}</td>"
                 f"<td>{html_escape(r.get('pnl_pct',''))}</td>"
@@ -814,62 +777,14 @@ async def dashboard():
         out.append("</tbody></table>")
         return "".join(out)
 
-    def render_compact_news(items: List[Dict[str, Any]]) -> str:
-        if not items:
-            return "<div class='muted'>No news cached.</div>"
-        out = ["<ul class='news'>"]
-        for it in items:
-            out.append(
-                "<li>"
-                f"<a href='{html_escape(it.get('link',''))}' target='_blank' rel='noopener noreferrer'>{html_escape(it.get('title',''))}</a>"
-                f"<span class='meta'> — {html_escape(it.get('source',''))}</span>"
-                f"<span class='tag'> {html_escape(it.get('resume',''))}</span>"
-                "</li>"
-            )
-        out.append("</ul>")
-        return "".join(out)
-
-    def render_compact_sec(items: List[Dict[str, Any]]) -> str:
-        if not items:
-            return "<div class='muted'>No SEC cached.</div>"
-        out = ["<ul class='news'>"]
-        for it in items:
-            out.append(
-                "<li>"
-                f"<span class='badge'>{html_escape(it.get('form',''))}</span>"
-                f"<a href='{html_escape(it.get('link',''))}' target='_blank' rel='noopener noreferrer'>{html_escape(it.get('title',''))}</a>"
-                f"<span class='meta'> — {html_escape(it.get('resume',''))}</span>"
-                "</li>"
-            )
-        out.append("</ul>")
-        return "".join(out)
-
-    # Build clean category sections (collapsible)
+    # Build industry sections (collapsible)
     category_html = ""
     for industry in ordered_industries(groups):
-        g = groups.get(industry) or {}
-        rows = g.get("rows") or []
-        tickers = g.get("tickers") or []
-        tickers = tickers[:CATEGORY_MAX_TICKERS_FOR_NEWS]
-
-        merged_news = _compact_merge_news(news_cache, tickers, CATEGORY_MAX_NEWS_ITEMS)
-        merged_sec = _compact_merge_sec(sec_cache, tickers, CATEGORY_MAX_SEC_ITEMS)
-
-        header_line = f"{industry} <span class='muted'>({len(rows)} positions)</span>"
+        rows = (groups.get(industry) or {}).get("rows") or []
         category_html += f"""
         <details class="section" open>
-          <summary>{header_line}</summary>
-          <div class="block">
-            {render_table(rows)}
-          </div>
-          <div class="block">
-            <div class="h">News</div>
-            {render_compact_news(merged_news)}
-          </div>
-          <div class="block">
-            <div class="h">SEC</div>
-            {render_compact_sec(merged_sec)}
-          </div>
+          <summary>{html_escape(industry)} <span class="muted">({len(rows)} positions)</span></summary>
+          <div class="block">{render_table(rows)}</div>
         </details>
         """
 
@@ -878,10 +793,8 @@ async def dashboard():
         crypto_html = f"""
         <details class="section">
           <summary>Crypto <span class="muted">({len(crypto_rows)} positions)</span></summary>
-          <div class="block">
-            {render_table(crypto_rows)}
-          </div>
-          <div class="muted">Crypto news/SEC not fetched by default.</div>
+          <div class="block">{render_table(crypto_rows)}</div>
+          <div class="muted">Click a ticker to open its links page.</div>
         </details>
         """
 
@@ -899,9 +812,9 @@ async def dashboard():
           }}
           a {{ color: #0b57d0; text-decoration:none; }}
           a:hover {{ text-decoration:underline; }}
-
           .muted {{ color:#555; }}
           .wrap {{ max-width: 1100px; }}
+
           .topline {{ display:flex; gap:18px; flex-wrap:wrap; align-items:baseline; }}
           code {{ background:#f3f3f3; border:1px solid #ddd; padding:2px 6px; border-radius:8px; }}
 
@@ -922,40 +835,7 @@ async def dashboard():
             font-size: 16px;
           }}
           .block {{ margin-top: 10px; }}
-          .h {{
-            font-weight: 700;
-            margin: 8px 0 6px;
-            font-size: 13px;
-            text-transform: uppercase;
-            letter-spacing: .08em;
-            color: #333;
-          }}
-          ul.news {{
-            margin: 6px 0 0 18px;
-            padding: 0;
-          }}
-          ul.news li {{
-            margin: 6px 0;
-            line-height: 1.25;
-            font-size: 14px;
-          }}
-          .meta {{
-            color:#555;
-            font-size: 12px;
-          }}
-          .tag {{
-            color:#222;
-            font-size: 12px;
-          }}
-          .badge {{
-            display:inline-block;
-            font-size:11px;
-            padding:2px 8px;
-            border-radius:999px;
-            border:1px solid #ddd;
-            background:#f5f5f5;
-            margin-right:6px;
-          }}
+
           pre {{
             white-space: pre-wrap;
             background:#f7f7f7;
@@ -992,7 +872,128 @@ async def dashboard():
           <h2>Stocks (industry groups)</h2>
           {category_html if category_html else "<div class='muted'>No categorized stock positions yet. Run /tasks/daily.</div>"}
 
+          <p class="muted">Click any ticker to open its links page (News + SEC).</p>
           <p class="muted">API: <code>/api/portfolio</code> • <code>/api/news</code> • <code>/api/sec</code> • <code>/api/daily-brief</code> • Debug: <code>/debug/mapping-last</code></p>
+        </div>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+
+@app.get("/t/{ticker}", response_class=HTMLResponse)
+async def ticker_page(ticker: str):
+    state = load_state()
+    t = normalize_ticker(ticker)
+
+    news_cache = state.get("news_cache") or {}
+    sec_cache = state.get("sec_cache") or {}
+
+    news_items = (news_cache.get(t) or [])[:NEWS_PER_TICKER]
+    sec_items = (sec_cache.get(t) or [])[:SEC_PER_TICKER]
+
+    def render_news():
+        if not news_items:
+            return "<div class='muted'>No news cached for this ticker. Run /tasks/daily.</div>"
+        out = ["<ul class='lst'>"]
+        for it in news_items:
+            out.append(
+                "<li>"
+                f"<a href='{html_escape(it.get('link',''))}' target='_blank' rel='noopener noreferrer'>{html_escape(it.get('title',''))}</a>"
+                f"<div class='meta'>{html_escape(it.get('source',''))} · {html_escape(it.get('published',''))}</div>"
+                f"<div class='tag'>{html_escape(it.get('resume',''))}</div>"
+                "</li>"
+            )
+        out.append("</ul>")
+        return "".join(out)
+
+    def render_sec():
+        if not sec_items:
+            return "<div class='muted'>No SEC cached for this ticker. (CIK_MAP improves this.)</div>"
+        out = ["<ul class='lst'>"]
+        for it in sec_items:
+            out.append(
+                "<li>"
+                f"<span class='badge'>{html_escape(it.get('form',''))}</span>"
+                f"<a href='{html_escape(it.get('link',''))}' target='_blank' rel='noopener noreferrer'>{html_escape(it.get('title',''))}</a>"
+                f"<div class='meta'>{html_escape(it.get('filed',''))}</div>"
+                f"<div class='tag'>{html_escape(it.get('resume',''))}</div>"
+                "</li>"
+            )
+        out.append("</ul>")
+        return "".join(out)
+
+    html = f"""
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>{html_escape(t)} — Links</title>
+        <style>
+          body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial;
+            margin: 24px;
+            background: #ffffff;
+            color: #000000;
+          }}
+          a {{ color: #0b57d0; text-decoration:none; }}
+          a:hover {{ text-decoration:underline; }}
+          .muted {{ color:#555; }}
+          .wrap {{ max-width: 1000px; }}
+          .top {{ display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }}
+          .btn {{
+            display:inline-block;
+            padding:6px 10px;
+            border:1px solid #ddd;
+            border-radius:10px;
+            background:#f5f5f5;
+            color:#111;
+            font-size:13px;
+          }}
+          .card {{
+            border:1px solid #ddd;
+            border-radius:12px;
+            padding:12px;
+            margin:12px 0;
+          }}
+          .h {{
+            font-weight:800;
+            font-size:13px;
+            text-transform:uppercase;
+            letter-spacing:.08em;
+            margin-bottom:8px;
+          }}
+          ul.lst {{ margin: 8px 0 0 18px; padding:0; }}
+          ul.lst li {{ margin: 10px 0; line-height:1.25; }}
+          .meta {{ font-size:12px; color:#555; margin-top:2px; }}
+          .tag {{ font-size:12px; color:#222; margin-top:2px; }}
+          .badge {{
+            display:inline-block;
+            font-size:11px;
+            padding:2px 8px;
+            border-radius:999px;
+            border:1px solid #ddd;
+            background:#f5f5f5;
+            margin-right:6px;
+          }}
+        </style>
+      </head>
+      <body>
+        <div class="wrap">
+          <div class="top">
+            <h1 style="margin:0;">{html_escape(t)}</h1>
+            <a class="btn" href="/" target="_self">Back</a>
+            <span class="muted">Last update: {html_escape(state.get("date") or utc_now_iso())}</span>
+          </div>
+
+          <div class="card">
+            <div class="h">News</div>
+            {render_news()}
+          </div>
+
+          <div class="card">
+            <div class="h">SEC</div>
+            {render_sec()}
+          </div>
         </div>
       </body>
     </html>
@@ -1041,34 +1042,25 @@ async def run_daily():
 
     instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
 
-    # Map instrumentId -> ticker via Search endpoint
+    # Map instrumentId -> ticker
     ticker_map, map_debug = await map_instrument_ids_to_tickers(instrument_ids)
     material_events.append(f"Mapped tickers via search: {map_debug['mapped']}/{map_debug['requested']}")
 
     portfolio_rows = build_portfolio_rows(agg_positions, ticker_map)
 
-    # Group (industry-like) + crypto
+    # Group industry + crypto
     grouped, crypto_rows = group_rows(portfolio_rows)
 
-    # Tickers for news/sec: stocks only
+    # tickers for news/sec: stocks only (crypto excluded)
     stock_tickers_for_news: List[str] = []
     for industry in grouped:
         stock_tickers_for_news.extend(grouped[industry].get("tickers") or [])
     stock_tickers_for_news = list(dict.fromkeys(stock_tickers_for_news))
 
-    # Fetch news + sec (stocks only)
     news_cache, sec_cache = await compute_news_and_sec(stock_tickers_for_news)
 
     technical_exceptions.append("Next: RSI/MACD/MAs/Volume/ADV + liquidity flags.")
     ai_brief = await generate_openai_brief(portfolio_rows) if portfolio_rows else "No positions."
-
-    # For state, keep groups as a compact structure
-    groups_for_state: Dict[str, Any] = {}
-    for industry, g in grouped.items():
-        groups_for_state[industry] = {
-            "rows": g.get("rows") or [],
-            "tickers": g.get("tickers") or [],
-        }
 
     state.update({
         "date": utc_now_iso(),
@@ -1083,7 +1075,7 @@ async def run_daily():
         "news_cache": news_cache,
         "sec_cache": sec_cache,
         "tickers": stock_tickers_for_news,
-        "groups": groups_for_state,
+        "groups": grouped,          # already JSON-friendly
         "crypto_rows": crypto_rows,
         "energy_thesis": ENERGY_THESIS,
     })
