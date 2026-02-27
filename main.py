@@ -1,32 +1,23 @@
 # main.py
-# Full single-file FastAPI app:
-# - Pulls your CURRENT eToro positions tickers (stocks only; crypto collisions excluded)
-# - Caches tickers into STATE["tickers"]
-# - Fetches News links (Google News RSS) + SEC filings links (EDGAR; CIK optional)
-# - Shows everything on /
-#
 # Railway startCommand:
 #   hypercorn main:app --bind "0.0.0.0:$PORT"
 #
-# Railway Variables you should set:
+# Required Railway Variables:
 #   ETORO_API_KEY=...
 #   ETORO_USER_KEY=...
+#
 # Optional:
 #   CRYPTO_EXCLUDE=W
-#   DEFAULT_UA=Mozilla/5.0 ...
-#   SEC_UA=YourName AppName (email@domain.com)
-#   CIK_MAP={"AAPL":"0000320193","MSFT":"0000789019"}   # optional for richer SEC per ticker
-# If eToro endpoint differs for your setup, override:
-#   ETORO_POSITIONS_URL=https://api.etorostatic.com/sapi/trading/positions/
-#
-# Usage:
-#   1) Deploy
-#   2) Open /tasks/daily once
-#   3) Open /
+#   NEWS_PER_TICKER=6
+#   SEC_PER_TICKER=6
+#   DEFAULT_UA=...
+#   SEC_UA="YourName AppName (email@domain.com)"
+#   CIK_MAP={"AAPL":"0000320193"}  # optional for richer SEC feed
 
 import os
 import re
 import json
+import uuid
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,10 +29,6 @@ import httpx
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-
-# ----------------------------
-# Config
-# ----------------------------
 
 APP_NAME = "Investing Dashboard"
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/investing_agent_state.json")
@@ -69,20 +56,16 @@ CRYPTO_EXCLUDE = set(
 
 CIK_MAP_JSON = os.getenv("CIK_MAP", "").strip()
 
-# eToro
+# eToro Public API keys (from eToro API portal)
 ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()
 ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip()
 
-# NOTE: you got a 301 earlier because of trailing slash / redirects.
-ETORO_POSITIONS_URL = os.getenv(
-    "ETORO_POSITIONS_URL",
-    "https://api.etorostatic.com/sapi/trading/positions/",
+# Correct public API endpoint for real account portfolio + positions/PnL
+ETORO_PNL_URL = os.getenv(
+    "ETORO_PNL_URL",
+    "https://public-api.etoro.com/api/v1/trading/info/real/pnl",
 ).strip()
 
-
-# ----------------------------
-# State
-# ----------------------------
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -113,10 +96,6 @@ STATE.setdefault("last_run", None)
 STATE.setdefault("debug", {})
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-
 def normalize_ticker(t: str) -> str:
     t = (t or "").strip().upper()
     t = re.sub(r"[^A-Z0-9\.\-]", "", t)
@@ -136,10 +115,10 @@ def html_escape(s: str) -> str:
     )
 
 
-def dedupe(items: List[str]) -> List[str]:
+def dedupe_list(xs: List[str]) -> List[str]:
     seen = set()
     out = []
-    for x in items:
+    for x in xs:
         if x and x not in seen:
             seen.add(x)
             out.append(x)
@@ -158,10 +137,6 @@ def dedupe_by_key(items: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]
     return out
 
 
-# ----------------------------
-# RSS / Atom parsing
-# ----------------------------
-
 def parse_rss_or_atom(xml_text: str) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     try:
@@ -169,7 +144,6 @@ def parse_rss_or_atom(xml_text: str) -> List[Dict[str, Any]]:
     except Exception:
         return items
 
-    # RSS2: channel/item
     channel = root.find("channel")
     if channel is not None:
         for item in channel.findall("item"):
@@ -181,7 +155,6 @@ def parse_rss_or_atom(xml_text: str) -> List[Dict[str, Any]]:
             })
         return items
 
-    # Atom: entry
     for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry"):
         title = safe_text(entry.findtext("{http://www.w3.org/2005/Atom}title"))
         updated = safe_text(entry.findtext("{http://www.w3.org/2005/Atom}updated"))
@@ -192,10 +165,6 @@ def parse_rss_or_atom(xml_text: str) -> List[Dict[str, Any]]:
         items.append({"title": title, "link": link, "published_raw": updated, "source": ""})
     return items
 
-
-# ----------------------------
-# Resume heuristics (no full-text reading)
-# ----------------------------
 
 def resume_news(title: str) -> str:
     t = (title or "").lower()
@@ -220,29 +189,25 @@ def resume_news(title: str) -> str:
 def resume_sec(form: str, title: str) -> str:
     f = (form or "").upper().strip()
     if f == "8-K":
-        return "Material event. Check for earnings release, financing, M&A, leadership changes, major contracts."
+        return "Material event. Check earnings release, financing, M&A, leadership changes, major contracts."
     if f == "10-Q":
-        return "Quarterly report. Focus on margins, cash burn/FCF, guidance, balance sheet."
+        return "Quarterly report. Focus margins, cash burn/FCF, guidance, balance sheet."
     if f == "10-K":
-        return "Annual report. Risks/business changes; liquidity, segment performance."
+        return "Annual report. Risks/business changes; liquidity, segments."
     if f in ("S-1", "F-1"):
-        return "Registration/IPO. Dilution risk; read use-of-proceeds and offering terms."
+        return "Registration/IPO. Dilution risk; check offering terms."
     if f.startswith("S-") or f.startswith("F-"):
         return "Registration statement. Often issuance/resale; dilution risk."
     if f.startswith("424B"):
-        return "Prospectus supplement. Financing details; pricing and dilution."
+        return "Prospectus supplement. Financing details; pricing/dilution."
     if f in ("SC 13D", "SC13D"):
-        return "Activist/large holder filing. Can be catalytic; check intent and stake change."
+        return "Activist/large holder filing. Can be catalytic; check intent."
     if f in ("SC 13G", "SC13G"):
         return "Passive holder filing. Useful sentiment signal."
     if f in ("DEF 14A", "DEFA14A"):
-        return "Proxy. Governance/compensation; can signal strategic shifts."
+        return "Proxy. Governance/comp; possible strategic hints."
     return "Filing update. Open link and skim cover + key sections."
 
-
-# ----------------------------
-# Data models
-# ----------------------------
 
 @dataclass
 class NewsItem:
@@ -264,96 +229,85 @@ class SecItem:
     resume: str
 
 
-# ----------------------------
-# eToro tickers (stocks only)
-# ----------------------------
-
-def build_etoro_headers() -> Dict[str, str]:
-    # Header names can vary depending on your earlier working code.
-    # This is a conservative set; adjust if your old code used different names.
-    h = {
+def etoro_headers() -> Dict[str, str]:
+    return {
         "accept": "application/json",
         "user-agent": DEFAULT_UA,
+        "x-api-key": ETORO_API_KEY,
+        "x-user-key": ETORO_USER_KEY,
+        "x-request-id": str(uuid.uuid4()),
     }
-    if ETORO_API_KEY:
-        h["authorization"] = f"Bearer {ETORO_API_KEY}"
-    if ETORO_USER_KEY:
-        h["x-etoro-user-key"] = ETORO_USER_KEY
-    return h
 
 
-def extract_tickers_from_positions_json(data: Any) -> List[str]:
+def extract_tickers_from_etoro_pnl(payload: Dict[str, Any]) -> List[str]:
     """
-    Tries to extract tickers from whatever shape eToro returns.
-    If your payload doesn't contain 'symbol'/'ticker' directly, you'll need your old instrumentID->ticker map.
+    The public PnL payload includes portfolio/positions. Field names may vary.
+    We try common shapes without guessing beyond safe keys.
     """
     positions: List[Dict[str, Any]] = []
 
-    if isinstance(data, list):
-        positions = data
-    elif isinstance(data, dict):
-        for k in ("positions", "data", "result", "items"):
-            v = data.get(k)
+    # Common: payload["clientPortfolio"]["positions"] or similar
+    cp = payload.get("clientPortfolio") if isinstance(payload, dict) else None
+    if isinstance(cp, dict):
+        for k in ("positions", "openPositions", "portfolioPositions"):
+            v = cp.get(k)
+            if isinstance(v, list):
+                positions = v
+                break
+
+    # Sometimes it’s at top-level
+    if not positions:
+        for k in ("positions", "openPositions", "portfolioPositions"):
+            v = payload.get(k) if isinstance(payload, dict) else None
             if isinstance(v, list):
                 positions = v
                 break
 
     raw: List[str] = []
     for p in positions:
-        sym = p.get("ticker") or p.get("symbol") or p.get("instrumentSymbol") or p.get("InstrumentSymbol")
+        # Try likely ticker fields
+        sym = (
+            p.get("ticker")
+            or p.get("symbol")
+            or p.get("instrumentSymbol")
+            or p.get("InstrumentSymbol")
+        )
         if sym:
             raw.append(normalize_ticker(str(sym)))
 
-    # filter crypto collisions
     tickers = sorted({t for t in raw if t and t not in CRYPTO_EXCLUDE})
     return tickers
 
 
-async def fetch_etoro_stock_tickers(client: httpx.AsyncClient) -> Tuple[List[str], Dict[str, Any]]:
-    """
-    Returns (tickers, debug).
-    """
-    dbg: Dict[str, Any] = {"positions_url": ETORO_POSITIONS_URL}
+async def fetch_etoro_tickers(client: httpx.AsyncClient) -> Tuple[List[str], Dict[str, Any]]:
+    dbg: Dict[str, Any] = {"url": ETORO_PNL_URL}
     if not ETORO_API_KEY or not ETORO_USER_KEY:
         dbg["error"] = "Missing ETORO_API_KEY or ETORO_USER_KEY"
         return [], dbg
 
-    headers = build_etoro_headers()
-
     try:
-        r = await client.get(ETORO_POSITIONS_URL, headers=headers)
+        r = await client.get(ETORO_PNL_URL, headers=etoro_headers())
         dbg["status_code"] = r.status_code
         if r.status_code != 200:
             dbg["body_head"] = r.text[:300]
             return [], dbg
-        data = r.json()
+        payload = r.json()
     except Exception as e:
         dbg["error"] = f"{type(e).__name__}: {e}"
         return [], dbg
 
-    tickers = extract_tickers_from_positions_json(data)
+    tickers = extract_tickers_from_etoro_pnl(payload)
     dbg["extracted"] = len(tickers)
-    if tickers:
-        dbg["sample"] = tickers[:10]
-    else:
-        dbg["note"] = "No tickers extracted. Your positions JSON may not include symbol/ticker fields; you may need instrumentID->ticker mapping from your older code."
+    dbg["sample"] = tickers[:10]
+    if not tickers:
+        dbg["note"] = "No tickers extracted from PnL payload. Inspect /debug/etoro-pnl for actual JSON keys."
     return tickers, dbg
 
-
-# ----------------------------
-# News + SEC fetch
-# ----------------------------
 
 async def fetch_google_news_rss(client: httpx.AsyncClient, ticker: str) -> List[NewsItem]:
     q = quote_plus(f"{ticker} stock")
     url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
-    r = await client.get(
-        url,
-        headers={
-            "accept": "application/rss+xml, text/xml;q=0.9,*/*;q=0.8",
-            "user-agent": DEFAULT_UA,
-        },
-    )
+    r = await client.get(url, headers={"accept": "application/rss+xml, text/xml;q=0.9,*/*;q=0.8", "user-agent": DEFAULT_UA})
     if r.status_code != 200:
         return []
     raw = parse_rss_or_atom(r.text)
@@ -388,17 +342,8 @@ async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[S
     cik = (cik_map.get(ticker) or "").strip()
     if cik:
         cik = cik.zfill(10)
-        url = (
-            "https://www.sec.gov/cgi-bin/browse-edgar"
-            f"?action=getcompany&CIK={cik}&owner=exclude&count=40&output=atom"
-        )
-        r = await client.get(
-            url,
-            headers={
-                "accept": "application/atom+xml, application/xml;q=0.9,*/*;q=0.8",
-                "user-agent": SEC_UA,
-            },
-        )
+        url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&owner=exclude&count=40&output=atom"
+        r = await client.get(url, headers={"accept": "application/atom+xml, application/xml;q=0.9,*/*;q=0.8", "user-agent": SEC_UA})
         if r.status_code != 200:
             return []
         raw = parse_rss_or_atom(r.text)
@@ -431,49 +376,20 @@ async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[S
         deduped = dedupe_by_key([x.__dict__ for x in out], "link")
         return [SecItem(**x) for x in deduped[:SEC_PER_TICKER]]
 
-    # fallback: always give a clickable EDGAR search
     search_link = f"https://www.sec.gov/edgar/search/#/q={quote_plus(ticker)}&sort=desc"
-    return [
-        SecItem(
-            ticker=ticker,
-            form="EDGAR",
-            title=f"EDGAR search for {ticker}",
-            link=search_link,
-            filed="",
-            resume="Click to see latest filings. For richer per-form lists, set CIK_MAP (ticker→CIK).",
-        )
-    ]
+    return [SecItem(ticker=ticker, form="EDGAR", title=f"EDGAR search for {ticker}", link=search_link, filed="", resume="Click to see latest filings. For richer lists, set CIK_MAP.")]
 
-
-# ----------------------------
-# Daily refresh
-# ----------------------------
 
 async def run_daily_refresh() -> Dict[str, Any]:
     started = now_utc_iso()
     sem = asyncio.Semaphore(CONCURRENCY)
-
     errors: List[str] = []
-    debug: Dict[str, Any] = {"started": started}
 
-    async with httpx.AsyncClient(
-        timeout=HTTP_TIMEOUT,
-        follow_redirects=True,  # FIX for your 301 redirect
-    ) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+        tickers, et_dbg = await fetch_etoro_tickers(client)
 
-        # 1) Pull tickers from eToro
-        tickers, et_dbg = await fetch_etoro_stock_tickers(client)
-        debug["etoro"] = et_dbg
-        if not tickers:
-            # keep existing tickers if present, but still report
-            tickers = [normalize_ticker(t) for t in (STATE.get("tickers") or [])]
-        tickers = [t for t in tickers if t and t not in CRYPTO_EXCLUDE]
-        tickers = dedupe(tickers)
+        STATE["tickers"] = dedupe_list([t for t in tickers if t and t not in CRYPTO_EXCLUDE])
 
-        # cache tickers
-        STATE["tickers"] = tickers
-
-        # 2) Fetch news + SEC
         news_cache: Dict[str, Any] = {}
         sec_cache: Dict[str, Any] = {}
 
@@ -488,13 +404,13 @@ async def run_daily_refresh() -> Dict[str, Any]:
                 return t, [x.__dict__ for x in items]
 
         try:
-            news_results = await asyncio.gather(*[gn(t) for t in tickers])
+            news_results = await asyncio.gather(*[gn(t) for t in STATE["tickers"]])
         except Exception as e:
             news_results = []
             errors.append(f"news_gather: {type(e).__name__}: {e}")
 
         try:
-            sec_results = await asyncio.gather(*[sec(t) for t in tickers])
+            sec_results = await asyncio.gather(*[sec(t) for t in STATE["tickers"]])
         except Exception as e:
             sec_results = []
             errors.append(f"sec_gather: {type(e).__name__}: {e}")
@@ -513,16 +429,11 @@ async def run_daily_refresh() -> Dict[str, Any]:
         "news_total": sum(len(v) for v in news_cache.values()),
         "sec_total": sum(len(v) for v in sec_cache.values()),
         "errors": errors[:50],
-        "note": "If extracted tickers=0, your eToro positions JSON likely lacks symbol/ticker fields. Then you must restore instrumentID->ticker mapping from your older code.",
-        "etoro_debug": debug.get("etoro", {}),
+        "etoro_debug": et_dbg,
     }
     save_state(STATE)
     return STATE["debug"]
 
-
-# ----------------------------
-# FastAPI app
-# ----------------------------
 
 app = FastAPI(title=APP_NAME)
 
@@ -536,6 +447,18 @@ def health() -> str:
 async def tasks_daily() -> Dict[str, Any]:
     dbg = await run_daily_refresh()
     return {"status": "ok", "debug": dbg}
+
+
+@app.get("/debug/etoro-pnl", response_class=JSONResponse)
+async def debug_etoro_pnl() -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+        r = await client.get(ETORO_PNL_URL, headers=etoro_headers())
+        return {"status_code": r.status_code, "body_head": r.text[:2000]}
+
+
+@app.get("/debug/tickers", response_class=PlainTextResponse)
+def debug_tickers() -> str:
+    return ",".join(STATE.get("tickers", []) or [])
 
 
 @app.get("/api/news", response_class=JSONResponse)
@@ -554,13 +477,6 @@ def api_sec(ticker: Optional[str] = None) -> Dict[str, Any]:
         t = normalize_ticker(ticker)
         return {"ticker": t, "items": cache.get(t, []), "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
     return {"tickers": STATE.get("tickers", []), "sec_cache": cache, "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
-
-
-@app.get("/debug/tickers", response_class=PlainTextResponse)
-def debug_tickers() -> str:
-    # prints current cached tickers ready for env paste
-    tickers = STATE.get("tickers", []) or []
-    return ",".join(tickers)
 
 
 def render_ticker_card(t: str) -> str:
@@ -642,8 +558,8 @@ def dashboard(limit: int = Query(80, ge=1, le=500)) -> str:
         <div class="card">
           <div class="muted">
             No tickers cached.<br/>
-            Ensure Railway Variables <code>ETORO_API_KEY</code> and <code>ETORO_USER_KEY</code> are set.<br/>
-            Then run <code>/tasks/daily</code>.
+            Set <code>ETORO_API_KEY</code> and <code>ETORO_USER_KEY</code>, then run <code>/tasks/daily</code>.<br/>
+            If it still shows 0, open <code>/debug/etoro-pnl</code>.
           </div>
         </div>
         """
@@ -680,8 +596,6 @@ def dashboard(limit: int = Query(80, ge=1, le=500)) -> str:
     .resume {{ font-size: 12px; margin-top: 6px; color: #c6d2dd; }}
     code {{ background: #0b111a; border: 1px solid #1f2a37; padding: 2px 6px; border-radius: 8px; color: #cfe2ff; }}
     .badge {{ display:inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid #314055; color: #cfe2ff; margin-right: 6px; }}
-    details {{ margin-top: 10px; }}
-    pre {{ white-space: pre-wrap; word-break: break-word; background:#0b111a; border:1px solid #1f2a37; padding:10px; border-radius:12px; color:#9fb0c0; font-size:12px; }}
   </style>
 </head>
 <body>
@@ -693,8 +607,7 @@ def dashboard(limit: int = Query(80, ge=1, le=500)) -> str:
       </div>
       <div class="row">
         <span class="pill"><a href="/tasks/daily" target="_blank" rel="noopener noreferrer">Run /tasks/daily</a></span>
-        <span class="pill"><a href="/api/news" target="_blank" rel="noopener noreferrer">/api/news</a></span>
-        <span class="pill"><a href="/api/sec" target="_blank" rel="noopener noreferrer">/api/sec</a></span>
+        <span class="pill"><a href="/debug/etoro-pnl" target="_blank" rel="noopener noreferrer">/debug/etoro-pnl</a></span>
         <span class="pill"><a href="/debug/tickers" target="_blank" rel="noopener noreferrer">/debug/tickers</a></span>
       </div>
     </div>
@@ -704,19 +617,10 @@ def dashboard(limit: int = Query(80, ge=1, le=500)) -> str:
     </div>
 
     {body}
-
-    <details>
-      <summary class="meta">Debug details (eToro extraction + errors)</summary>
-      <pre>{html_escape(json.dumps(dbg, ensure_ascii=False, indent=2))}</pre>
-    </details>
-
-    <div class="meta" style="margin-top:18px;">
-      SEC richer mode: set <code>CIK_MAP</code> (ticker→CIK). SEC also needs <code>SEC_UA</code>.
-    </div>
   </div>
 </body>
 </html>
 """
 
 
-# End.
+# end
