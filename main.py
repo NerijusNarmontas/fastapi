@@ -1,486 +1,1008 @@
-# main.py
-# Silent agent runner:
-# - Loads portfolio symbols (hardcoded or via holdings.json)
-# - Fetches: news (Google News RSS) + filings (SEC EDGAR, US only)
-# - Computes: energy thesis assessment (rule-based scoring)
-# - Outputs: one JSON file (no essays on screen). Prints nothing unless ERROR.
-
-from __future__ import annotations
-
 import os
 import json
-import time
-import traceback
-from dataclasses import dataclass, asdict
+import uuid
+import asyncio
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus
+from collections import defaultdict
 
-import requests
-import feedparser
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi.responses import HTMLResponse, JSONResponse
 
+# ============================================================
+# GOALS (your requirements)
+# 1) Stocks-only view (crypto excluded)
+# 2) Crypto tickers like W (Wormhole) must be removed even if the symbol collides with a stock
+# 3) Technicals computed reliably:
+#    - Primary candles: Stooq (free)
+#    - Fallback candles: eToro (by instrumentId) with rate-limit backoff (fixes 429)
+# 4) Keep "empty Tech" understandable (OK / NO_TECH)
+# ============================================================
 
-# ----------------------------
-# Telemetry / helpers
-# ----------------------------
-
-@dataclass
-class FetchResult:
-    symbol: str
-    provider: str
-    kind: str                 # "news" or "filings"
-    status: str               # ok|empty|auth_missing|forbidden|rate_limited|timeout|parse_error|not_supported|error
-    http_code: Optional[int] = None
-    elapsed_ms: Optional[int] = None
-    items: int = 0
-    error: Optional[str] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-class Timer:
-    def __enter__(self):
-        self.t0 = time.perf_counter()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.elapsed_ms = int((time.perf_counter() - self.t0) * 1000)
-
-
-def safe_err(e: Exception) -> str:
-    s = "".join(traceback.format_exception_only(type(e), e)).strip()
-    return s[:500]
-
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
+app = FastAPI(title="My AI Investing Agent")
 
 # ----------------------------
-# News provider: Google News RSS (no API key)
+# ENV VARS (Railway)
 # ----------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()
+ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip()
 
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()  # optional
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()                  # optional
 
-def fetch_news_google_rss(
-    symbol: str,
-    company_name: Optional[str] = None,
-    max_items: int = 5,
-    timeout: int = 12,
-) -> Tuple[Optional[int], List[Dict[str, Any]]]:
-    """
-    Returns (http_status, items)
-    Each item: {published_at, source, title, url}
-    """
-    if company_name:
-        q = f'("{symbol}" OR "{company_name}") (stock OR shares OR earnings OR guidance OR acquisition OR merger)'
-    else:
-        q = f'"{symbol}" stock'
+# Universe controls
+EXCLUDE_CRYPTO = os.getenv("EXCLUDE_CRYPTO", "true").strip().lower() in ("1", "true", "yes", "y")
 
-    url = GOOGLE_NEWS_RSS.format(query=quote_plus(q))
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-    status = r.status_code
-    if status != 200:
-        return status, []
-
-    feed = feedparser.parse(r.text)
-    out: List[Dict[str, Any]] = []
-
-    for e in feed.entries[: max_items * 3]:
-        title = getattr(e, "title", None)
-        link = getattr(e, "link", None)
-        published = getattr(e, "published", None) or getattr(e, "updated", None)
-
-        source = None
-        if hasattr(e, "source") and isinstance(e.source, dict):
-            source = e.source.get("title")
-
-        if not title or not link:
-            continue
-
-        out.append(
-            {
-                "published_at": published,
-                "source": source or "Google News",
-                "title": title,
-                "url": link,
-            }
-        )
-        if len(out) >= max_items:
-            break
-
-    return status, out
-
-
-# ----------------------------
-# Filings provider: SEC EDGAR (no API key; needs real User-Agent)
-# ----------------------------
-
-SEC_TICKER_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
-SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
-
-
-def sec_headers(user_agent: str) -> Dict[str, str]:
-    return {
-        "User-Agent": user_agent,
-        "Accept-Encoding": "gzip, deflate",
-        "Accept": "application/json",
-    }
-
-
-def load_sec_cik_map(user_agent: str, timeout: int = 15) -> Tuple[Optional[int], Dict[str, str]]:
-    r = requests.get(SEC_TICKER_CIK_URL, headers=sec_headers(user_agent), timeout=timeout)
-    if r.status_code != 200:
-        return r.status_code, {}
-
-    data = r.json()
-    out: Dict[str, str] = {}
-    for _, v in data.items():
-        t = str(v.get("ticker", "")).upper().strip()
-        cik = str(v.get("cik_str", "")).strip().zfill(10)
-        if t and cik:
-            out[t] = cik
-    return 200, out
-
-
-def fetch_latest_filings_sec(
-    symbol: str,
-    cik_map: Dict[str, str],
-    user_agent: str,
-    max_items: int = 6,
-    timeout: int = 15,
-) -> Tuple[Optional[int], List[Dict[str, Any]]]:
-    """
-    Returns (http_status, items)
-    Each item: {type, filed_at, accession, report_date, primary_doc, url}
-    """
-    tkr = symbol.upper().strip()
-    cik = cik_map.get(tkr)
-    if not cik:
-        return None, []  # not supported / non-US / not in SEC map
-
-    url = SEC_SUBMISSIONS_URL.format(cik=cik)
-    r = requests.get(url, headers=sec_headers(user_agent), timeout=timeout)
-    status = r.status_code
-    if status != 200:
-        return status, []
-
-    j = r.json()
-    recent = (j.get("filings", {}) or {}).get("recent", {}) or {}
-
-    forms = recent.get("form", []) or []
-    filed = recent.get("filingDate", []) or []
-    accession = recent.get("accessionNumber", []) or []
-    report_date = recent.get("reportDate", []) or []
-    primary_doc = recent.get("primaryDocument", []) or []
-
-    keep = {"10-K", "10-Q", "8-K", "20-F", "6-K", "S-1", "424B", "DEF 14A"}
-    out: List[Dict[str, Any]] = []
-
-    n = min(len(forms), len(filed), len(accession), len(primary_doc))
-    for i in range(n):
-        form = str(forms[i])
-        if form not in keep:
-            continue
-
-        acc_no_dashes = str(accession[i]).replace("-", "")
-        filing_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_dashes}/{primary_doc[i]}"
-
-        out.append(
-            {
-                "type": form,
-                "filed_at": filed[i],
-                "accession": accession[i],
-                "report_date": report_date[i] if i < len(report_date) else None,
-                "primary_doc": primary_doc[i],
-                "url": filing_url,
-            }
-        )
-        if len(out) >= max_items:
-            break
-
-    return status, out
-
-
-# ----------------------------
-# Thesis scoring (rule-based; no screen text)
-# ----------------------------
-
-DEFAULT_THESIS_RULES = {
-    "version": "energy_thesis_v1",
-    "hard_excludes": {
-        "industries": ["Oil & Gas Refining & Marketing", "Refining"],
-        "tags": ["DOWNSTREAM_HEAVY", "REFINING"],
-    },
-    "weights": {
-        "segment_fit": 25,         # upstream/midstream/nuclear alignment
-        "gas_leverage": 20,
-        "capital_discipline": 20,
-        "balance_sheet": 15,
-        "cash_return": 15,
-        "geo_relevance": 5,
-    },
-    "thresholds": {
-        "net_debt_to_ebitda_good": 1.5,
-        "shareholder_yield_good": 0.08,
-    },
+# IMPORTANT:
+# You confirmed: "W" in your eToro portfolio is Wormhole crypto.
+# We will classify crypto using BOTH:
+#   - instrumentId heuristic (most crypto IDs are >= 100000 in your data)
+#   - denylist fallback
+CRYPTO_DENY = {
+    x.strip().upper()
+    for x in os.getenv(
+        "CRYPTO_DENY",
+        # includes your crypto list: SEI, STRK, PYTH, HBAR, EIGEN, HYPE, W (Wormhole)
+        "BTC,ETH,SOL,ADA,XRP,DOT,AVAX,LINK,OP,RUNE,WLD,JTO,ARB,ATOM,NEAR,APT,SUI,CRO,SEI,STRK,PYTH,HBAR,EIGEN,HYPE,W",
+    ).split(",")
+    if x.strip()
 }
 
+# Heuristic: in your dataset crypto instrumentIDs look like 100000+
+CRYPTO_ID_MIN = int(os.getenv("CRYPTO_ID_MIN", "100000"))
 
-def load_rules(path: str = "thesis_rules.json") -> Dict[str, Any]:
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
+STATE_PATH = "/tmp/investing_agent_state.json"
+
+# ----------------------------
+# eToro endpoints
+# ----------------------------
+ETORO_REAL_PNL_URL = "https://public-api.etoro.com/api/v1/trading/info/real/pnl"
+ETORO_SEARCH_URL = "https://public-api.etoro.com/api/v1/market-data/search"
+ETORO_CANDLES_URL_TMPL = "https://public-api.etoro.com/api/v1/market-data/instruments/{instrumentId}/history/candles/asc/OneDay/{count}"
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def load_state() -> Dict[str, Any]:
+    if not os.path.exists(STATE_PATH):
+        return {}
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
-    return DEFAULT_THESIS_RULES
+    except Exception:
+        return {}
 
 
-def score_energy_thesis(symbol: str, facts: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
+def save_state(state: Dict[str, Any]) -> None:
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def require_admin(request: Request) -> None:
+    if ADMIN_TOKEN:
+        token = request.headers.get("x-admin-token", "")
+        if token != ADMIN_TOKEN:
+            raise HTTPException(status_code=401, detail="Missing/invalid x-admin-token")
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def normalize_number(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def pick_instrument_id(p: Dict[str, Any]) -> Optional[int]:
+    iid = p.get("instrumentID") or p.get("instrumentId") or p.get("InstrumentId")
+    try:
+        return int(iid) if iid is not None else None
+    except Exception:
+        return None
+
+
+def pick_unrealized_pnl(p: Dict[str, Any]) -> Optional[float]:
+    return normalize_number(p.get("unrealizedPnL") or p.get("unrealizedPnl") or p.get("unrealized_pnl"))
+
+
+def pick_initial_usd(p: Dict[str, Any]) -> Optional[float]:
+    return normalize_number(p.get("initialAmountInDollars") or p.get("initialAmount") or p.get("initial_amount_usd"))
+
+
+def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    cp = payload.get("clientPortfolio") or payload.get("ClientPortfolio") or {}
+    if isinstance(cp, dict) and isinstance(cp.get("positions"), list):
+        return cp["positions"]
+    if isinstance(payload.get("positions"), list):
+        return payload["positions"]
+    return []
+
+
+def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    buckets = defaultdict(list)
+    for p in raw_positions:
+        iid = pick_instrument_id(p)
+        if iid is None:
+            continue
+        buckets[iid].append(p)
+
+    aggregated: List[Dict[str, Any]] = []
+    for iid, lots in buckets.items():
+        total_initial_usd = sum(float(pick_initial_usd(x) or 0) for x in lots)
+        total_unreal_pnl = sum(float(pick_unrealized_pnl(x) or 0) for x in lots)
+        aggregated.append({
+            "instrumentID": iid,
+            "lots": len(lots),
+            "initialAmountInDollars": total_initial_usd,
+            "unrealizedPnL": total_unreal_pnl,
+        })
+
+    aggregated.sort(key=lambda x: x.get("initialAmountInDollars", 0) or 0, reverse=True)
+    stats = {"lots_count": len(raw_positions), "unique_instruments_count": len(aggregated)}
+    return aggregated, stats
+
+
+def looks_like_numeric_id(s: str) -> bool:
+    return (s or "").strip().isdigit()
+
+
+def is_crypto_ticker(ticker: str) -> bool:
+    t = (ticker or "").upper().strip()
+    if not t:
+        return False
+    if t in CRYPTO_DENY:
+        return True
+    if t.endswith("-USD") or t.endswith("USD") or t.endswith("USDT"):
+        return True
+    return False
+
+
+def is_crypto_instrument(instrument_id: int, ticker: str) -> bool:
     """
-    facts = structured fields (best effort).
-    Required-ish keys (if missing, scorer uses neutral defaults):
-      - industry (str)
-      - tags (list[str]) e.g. UPSTREAM, MIDSTREAM, URANIUM, NUCLEAR, REFINING
-      - geo (str) e.g. US, CANADA, EU, OTHER
-      - revenue_mix_gas_pct (0..1)
-      - net_debt_to_ebitda (float)
-      - shareholder_yield (float)  # dividend+buyback / market cap, 0..1
-      - capex_growth_pct (float)   # <=0 good, high positive bad
+    Strong crypto classification:
+    - if instrument_id >= CRYPTO_ID_MIN => crypto (matches your eToro pattern)
+    - else fallback to denylist rules
+    This is what makes "W" safe: Wayfair W would NOT have a 100xxx id.
     """
-    industry = (facts.get("industry") or "").strip()
-    tags = set([str(x).upper() for x in (facts.get("tags") or [])])
-    geo = (facts.get("geo") or "OTHER").upper()
+    try:
+        if int(instrument_id) >= CRYPTO_ID_MIN:
+            return True
+    except Exception:
+        pass
+    return is_crypto_ticker(ticker)
 
-    exclude_reasons: List[str] = []
-    for bad_ind in rules["hard_excludes"].get("industries", []):
-        if bad_ind.lower() in industry.lower():
-            exclude_reasons.append(f"industry:{bad_ind}")
-    for bad_tag in rules["hard_excludes"].get("tags", []):
-        if bad_tag.upper() in tags:
-            exclude_reasons.append(f"tag:{bad_tag.upper()}")
 
-    if exclude_reasons:
-        return {
-            "symbol": symbol,
-            "thesis_score": 0,
-            "pillar_scores": {},
-            "flags": [],
-            "exclude": True,
-            "exclude_reasons": exclude_reasons,
-        }
+# ============================================================
+# eTORO HTTP
+# ============================================================
 
-    w = rules["weights"]
-    t = rules["thresholds"]
-    pillar: Dict[str, int] = {}
-    flags: List[str] = []
-
-    # Segment fit: upstream/midstream/nuclear/uranium are "in-thesis"
-    segment_fit = 0.0
-    if "UPSTREAM" in tags:
-        segment_fit = max(segment_fit, 1.0)
-    if "MIDSTREAM" in tags:
-        segment_fit = max(segment_fit, 0.85)
-    if "NUCLEAR" in tags or "URANIUM" in tags:
-        segment_fit = max(segment_fit, 1.0)
-        flags.append("NUCLEAR_BUCKET")
-
-    pillar["segment_fit"] = int(round(w["segment_fit"] * clamp(segment_fit, 0, 1)))
-
-    # Gas leverage
-    gas_pct = float(facts.get("revenue_mix_gas_pct") or 0.0)
-    if gas_pct >= 0.5:
-        flags.append("US_GAS_LEVERAGE" if geo == "US" else "GAS_LEVERAGE")
-    pillar["gas_leverage"] = int(round(w["gas_leverage"] * clamp(gas_pct, 0, 1)))
-
-    # Capital discipline proxy (capex growth)
-    capex_growth = facts.get("capex_growth_pct")
-    if capex_growth is None:
-        capex_score = 0.5
-    else:
-        # <=0 good; 50%+ growth -> 0
-        capex_score = 1.0 if capex_growth <= 0.0 else clamp(1.0 - (float(capex_growth) / 0.5), 0, 1)
-    pillar["capital_discipline"] = int(round(w["capital_discipline"] * capex_score))
-
-    # Balance sheet (net debt / EBITDA)
-    nde = facts.get("net_debt_to_ebitda")
-    if nde is None:
-        bs_score = 0.5
-    else:
-        nde = float(nde)
-        bs_score = 1.0 if nde <= t["net_debt_to_ebitda_good"] else clamp(t["net_debt_to_ebitda_good"] / nde, 0, 1)
-    pillar["balance_sheet"] = int(round(w["balance_sheet"] * bs_score))
-
-    # Cash return (shareholder yield)
-    sh_yield = facts.get("shareholder_yield")
-    if sh_yield is None:
-        cr_score = 0.4
-    else:
-        sh_yield = float(sh_yield)
-        cr_score = 1.0 if sh_yield >= t["shareholder_yield_good"] else clamp(sh_yield / t["shareholder_yield_good"], 0, 1)
-    pillar["cash_return"] = int(round(w["cash_return"] * cr_score))
-
-    # Geo relevance (simple; tweak later)
-    geo_score = 1.0 if geo in {"US", "CANADA"} else 0.7
-    pillar["geo_relevance"] = int(round(w["geo_relevance"] * geo_score))
-
-    total = int(sum(pillar.values()))
+def etoro_headers() -> Dict[str, str]:
+    if not ETORO_API_KEY or not ETORO_USER_KEY:
+        return {}
     return {
-        "symbol": symbol,
-        "thesis_score": total,
-        "pillar_scores": pillar,
-        "flags": flags,
-        "exclude": False,
-        "exclude_reasons": [],
+        "x-api-key": ETORO_API_KEY,
+        "x-user-key": ETORO_USER_KEY,
+        "x-request-id": str(uuid.uuid4()),
+        "user-agent": "fastapi-investing-agent/1.0",
+        "accept": "application/json",
     }
 
 
-# ----------------------------
-# Facts layer (you can replace with real fundamentals later)
-# ----------------------------
+async def etoro_get_real_pnl() -> Dict[str, Any]:
+    if not ETORO_API_KEY or not ETORO_USER_KEY:
+        raise HTTPException(status_code=400, detail="Missing ETORO_API_KEY or ETORO_USER_KEY")
 
-def load_facts(path: str = "facts.json") -> Dict[str, Dict[str, Any]]:
-    """
-    Optional file you maintain/update:
-      {
-        "EQT": {"industry":"Oil & Gas E&P", "tags":["UPSTREAM"], "geo":"US", "revenue_mix_gas_pct":0.9, ...},
-        "EPD": {"industry":"Midstream", "tags":["MIDSTREAM"], "geo":"US", ...}
-      }
-    If missing, returns empty dict and scorer uses neutral defaults.
-    """
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def load_symbols() -> List[str]:
-    """
-    Option A: holdings.json with {"symbols":["EQT","DVN",...]}
-    Option B: set env SYMBOLS="EQT,DVN,EPD"
-    Option C: fallback hardcoded sample list.
-    """
-    if os.path.exists("holdings.json"):
-        with open("holdings.json", "r", encoding="utf-8") as f:
-            j = json.load(f)
-            syms = j.get("symbols") or []
-            return [str(x).upper().strip() for x in syms if str(x).strip()]
-
-    env_syms = os.getenv("SYMBOLS", "").strip()
-    if env_syms:
-        return [s.strip().upper() for s in env_syms.split(",") if s.strip()]
-
-    # Fallback sample
-    return ["EQT", "DVN", "EPD", "CCJ", "LEU", "SMR", "OKLO"]
-
-
-# ----------------------------
-# Runner (silent)
-# ----------------------------
-
-def run_agent() -> Dict[str, Any]:
-    symbols = load_symbols()
-    facts_db = load_facts()
-    rules = load_rules("thesis_rules.json")
-
-    # Optional: improves news queries (you can put this in facts.json too)
-    company_names = {sym: (facts_db.get(sym, {}).get("company_name")) for sym in symbols}
-    company_names = {k: v for k, v in company_names.items() if v}
-
-    sec_user_agent = os.getenv("SEC_USER_AGENT", "").strip()
-    if not sec_user_agent:
-        sec_user_agent = "MyStockAgent (set SEC_USER_AGENT env var)"  # may get blocked by SEC
-
-    telemetry: List[Dict[str, Any]] = []
-
-    cik_status, cik_map = load_sec_cik_map(sec_user_agent)
-    if cik_status != 200:
-        cik_map = {}
-
-    news_requested = len(symbols)
-    filings_requested = len(symbols)
-    news_fetched = 0
-    filings_fetched = 0
-
-    results: Dict[str, Any] = {}
-
-    for sym in symbols:
-        results[sym] = {"symbol": sym}
-
-        # --- Thesis scoring (always runs)
-        facts = facts_db.get(sym, {})
-        results[sym]["thesis"] = score_energy_thesis(sym, facts, rules)
-
-        # --- News
-        with Timer() as t:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(ETORO_REAL_PNL_URL, headers=etoro_headers())
+        if r.status_code >= 400:
             try:
-                http_code, items = fetch_news_google_rss(sym, company_name=company_names.get(sym))
-                status = "ok" if items else "empty"
-                if items:
-                    news_fetched += 1
-                telemetry.append(
-                    FetchResult(sym, "google_rss", "news", status, http_code, t.elapsed_ms, len(items)).to_dict()
-                )
-                results[sym]["news"] = items  # remove if you want ultra-compact output
-            except Exception as e:
-                telemetry.append(
-                    FetchResult(sym, "google_rss", "news", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict()
-                )
-                results[sym]["news"] = []
+                payload = r.json()
+            except Exception:
+                payload = {"text": r.text}
+            raise HTTPException(status_code=r.status_code, detail=payload)
+        return r.json()
 
-        # --- Filings
-        with Timer() as t:
-            try:
-                http_code, items = fetch_latest_filings_sec(sym, cik_map, sec_user_agent)
-                if http_code is None and not items:
-                    status = "not_supported"
+
+async def etoro_search(params: Dict[str, str]) -> Tuple[int, Any]:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(ETORO_SEARCH_URL, headers=etoro_headers(), params=params)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"text": r.text}
+        return r.status_code, data
+
+
+def _extract_ticker_from_search_item(item: Dict[str, Any]) -> str:
+    for k in ("internalSymbolFull", "symbolFull", "symbol", "ticker", "displaySymbol"):
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+async def map_instrument_ids_to_tickers_search(instrument_ids: List[int], state: Dict[str, Any]) -> Tuple[Dict[int, str], Dict[str, Any]]:
+    """
+    Maps instrumentId -> ticker using /market-data/search.
+    Uses cache stored in state['ticker_cache'].
+    """
+    ids = sorted(set(int(x) for x in instrument_ids if x is not None))
+
+    cache_raw = state.get("ticker_cache") or {}
+    cache: Dict[int, str] = {}
+    for k, v in cache_raw.items():
+        try:
+            cache[int(k)] = str(v)
+        except Exception:
+            continue
+
+    missing = [iid for iid in ids if iid not in cache or not cache[iid] or looks_like_numeric_id(cache[iid])]
+
+    debug = {"requested": len(ids), "mapped": 0, "failed": 0, "samples": []}
+
+    sem = asyncio.Semaphore(10)
+
+    async def one(iid: int):
+        async with sem:
+            patterns = [
+                {"instrumentId": str(iid), "pageSize": "5", "pageNumber": "1"},
+                {"internalInstrumentId": str(iid), "pageSize": "5", "pageNumber": "1"},
+                {"q": str(iid), "pageSize": "5", "pageNumber": "1"},
+            ]
+
+            for params in patterns:
+                status, data = await etoro_search(params)
+                items = data.get("items") if isinstance(data, dict) else None
+                if isinstance(items, list) and items:
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        t = _extract_ticker_from_search_item(it)
+                        if t and not looks_like_numeric_id(t):
+                            cache[iid] = t
+                            debug["mapped"] += 1
+                            if len(debug["samples"]) < 12:
+                                debug["samples"].append({"instrumentID": iid, "ticker": t, "status": status, "params": params})
+                            return
+
+            debug["failed"] += 1
+            if len(debug["samples"]) < 12:
+                debug["samples"].append({"instrumentID": iid, "status": "no_match"})
+
+    await asyncio.gather(*(one(i) for i in missing))
+
+    state["ticker_cache"] = {str(k): v for k, v in cache.items()}
+    state["mapping"] = {"cached": len([iid for iid in ids if iid in cache and not looks_like_numeric_id(cache[iid])]), "total": len(ids)}
+    state["mapping_last_debug"] = {"missing": len(missing), "cached_total": len(cache), "total_today": len(ids), "debug": debug}
+    save_state(state)
+
+    return cache, debug
+
+
+async def etoro_get_daily_candles(instrument_id: int, count: int = 260) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Fallback candles directly from eToro by instrumentId.
+    FIX: rate-limit backoff for HTTP 429 (your BOE.ASX showed 429).
+    """
+    url = ETORO_CANDLES_URL_TMPL.format(instrumentId=instrument_id, count=count)
+    dbg = {"provider": "etoro", "instrumentId": instrument_id, "requested": count, "status": "init", "http": None, "error": None}
+
+    for attempt in range(1, 6):  # up to 5 tries
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(url, headers=etoro_headers())
+                dbg["http"] = r.status_code
+
+                if r.status_code == 429:
+                    dbg["status"] = "rate_limited"
+                    # Backoff: 1s,2s,4s,8s,16s
+                    await asyncio.sleep(min(16, 2 ** (attempt - 1)))
+                    continue
+
+                if r.status_code >= 400:
+                    dbg["status"] = "http_error"
+                    dbg["error"] = (r.text or "")[:300]
+                    return [], dbg
+
+                data = r.json()
+        except Exception as e:
+            dbg["status"] = "exception"
+            dbg["error"] = repr(e)
+            await asyncio.sleep(0.5 * attempt)
+            continue
+
+        candles: List[Dict[str, Any]] = []
+        if isinstance(data, dict):
+            if isinstance(data.get("candles"), list) and data["candles"]:
+                g0 = data["candles"][0]
+                if isinstance(g0, dict) and isinstance(g0.get("candles"), list):
+                    candles = [c for c in g0["candles"] if isinstance(c, dict)]
+            elif isinstance(data.get("items"), list):
+                candles = [c for c in data["items"] if isinstance(c, dict)]
+
+        if not candles:
+            dbg["status"] = "empty"
+            return [], dbg
+
+        dbg["status"] = "ok"
+        dbg["rows"] = len(candles)
+        return candles, dbg
+
+    dbg["status"] = "rate_limited_exhausted" if dbg.get("http") == 429 else dbg["status"]
+    return [], dbg
+
+
+# ============================================================
+# STOCK CANDLES (Stooq primary)
+# ============================================================
+
+async def stooq_get_daily_candles(ticker: str, count: int = 260) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Fetch daily OHLCV candles from Stooq CSV endpoint.
+    For US listings, Stooq usually expects ".us".
+    """
+    t = (ticker or "").strip()
+    dbg: Dict[str, Any] = {"provider": "stooq", "input": ticker, "requested": count, "status": "init", "http": None, "error": None}
+
+    if not t:
+        dbg["status"] = "empty_ticker"
+        return [], dbg
+
+    if looks_like_numeric_id(t):
+        dbg["status"] = "numeric_not_ticker"
+        return [], dbg
+
+    s = t.lower()
+    # if caller already supplied a suffix, keep it (e.g., BOE.ASX)
+    if "." not in s:
+        s = f"{s}.us"
+
+    url = "https://stooq.com/q/d/l/"
+    params = {"s": s, "i": "d"}
+
+    # retry loop (helps transient ConnectError)
+    last_err = None
+    text = ""
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.get(url, params=params, headers={"accept": "text/csv"})
+                dbg["http"] = r.status_code
+                if r.status_code >= 400:
+                    dbg["status"] = "http_error"
+                    dbg["error"] = (r.text or "")[:300]
+                    return [], dbg
+                text = r.text or ""
+                last_err = None
+                break
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(0.6 * attempt)
+
+    if last_err is not None:
+        dbg["status"] = "exception"
+        dbg["error"] = repr(last_err)
+        return [], dbg
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2 or "date" not in lines[0].lower():
+        dbg["status"] = "bad_csv"
+        dbg["error"] = (text or "")[:300]
+        return [], dbg
+
+    candles: List[Dict[str, Any]] = []
+    for ln in lines[1:]:
+        parts = ln.split(",")
+        if len(parts) < 6:
+            continue
+        d, o, h, l, c, v = parts[:6]
+        try:
+            candles.append({
+                "fromDate": d,
+                "open": float(o),
+                "high": float(h),
+                "low": float(l),
+                "close": float(c),
+                "volume": float(v) if v not in ("", "-") else 0.0,
+            })
+        except Exception:
+            continue
+
+    if not candles:
+        dbg["status"] = "no_rows"
+        return [], dbg
+
+    candles = candles[-max(1, int(count)):]
+    dbg["status"] = "ok"
+    dbg["rows"] = len(candles)
+    return candles, dbg
+
+
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
+
+def sma(values: List[float], n: int) -> Optional[float]:
+    if len(values) < n:
+        return None
+    return sum(values[-n:]) / n
+
+
+def ema_series(values: List[float], n: int) -> List[float]:
+    if not values:
+        return []
+    k = 2 / (n + 1)
+    out = []
+    e = values[0]
+    out.append(e)
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def rsi(closes: List[float], n: int = 14) -> Optional[float]:
+    if len(closes) <= n:
+        return None
+    gains, losses = 0.0, 0.0
+    for i in range(-n, 0):
+        ch = closes[i] - closes[i - 1]
+        if ch >= 0:
+            gains += ch
+        else:
+            losses -= ch
+    if losses == 0:
+        return 100.0
+    rs = (gains / n) / (losses / n)
+    return 100 - (100 / (1 + rs))
+
+
+def macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    if len(closes) < slow + signal:
+        return None, None, None
+    fast_ = ema_series(closes, fast)
+    slow_ = ema_series(closes, slow)
+    macd_line = [f - s for f, s in zip(fast_, slow_)]
+    sig = ema_series(macd_line, signal)
+    return macd_line[-1], sig[-1], (macd_line[-1] - sig[-1])
+
+
+def tech_tags(t: Dict[str, Any]) -> str:
+    tags = []
+    r = t.get("rsi14")
+    if isinstance(r, (int, float)):
+        if r >= 70:
+            tags.append("RSI_OB")
+        elif r <= 30:
+            tags.append("RSI_OS")
+
+    above200 = t.get("above_sma200")
+    if above200 is True:
+        tags.append(">SMA200")
+    elif above200 is False:
+        tags.append("<SMA200")
+
+    mh = t.get("macd_hist")
+    if isinstance(mh, (int, float)):
+        tags.append("MACD+" if mh >= 0 else "MACD-")
+
+    illq = t.get("illiquid")
+    if illq:
+        tags.append("ILLQ")
+
+    return " | ".join(tags)
+
+
+# ============================================================
+# TECH PIPELINE
+# ============================================================
+
+# Separate throttle for eToro fallback calls to avoid 429 bursts.
+_ETORO_FALLBACK_SEM = asyncio.Semaphore(int(os.getenv("ETORO_FALLBACK_CONCURRENCY", "2")))
+
+
+async def compute_technicals_for_ids(
+    instrument_ids: List[int],
+    ticker_map: Dict[int, str],
+    candles_count: int = 260,
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
+    """
+    Stocks-only technicals:
+      - skip missing tickers / numeric ids
+      - skip crypto (EXCLUDE_CRYPTO) using instrumentId heuristic + denylist
+      - primary candles: Stooq
+      - fallback candles: eToro (rate-limit protected + low concurrency)
+    """
+    ids = sorted(set(int(x) for x in instrument_ids if x is not None))
+    tech_map: Dict[int, Dict[str, Any]] = {}
+    debug: Dict[str, Any] = {
+        "provider": "stooq+etoro_fallback",
+        "requested": len(ids),
+        "computed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "samples": [],
+    }
+
+    sem = asyncio.Semaphore(7)
+
+    async def one(iid: int):
+        async with sem:
+            ticker = (ticker_map.get(iid) or "").strip()
+
+            if not ticker or looks_like_numeric_id(ticker):
+                debug["skipped"] += 1
+                if len(debug["samples"]) < 20:
+                    debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "skipped_no_ticker"})
+                return
+
+            if EXCLUDE_CRYPTO and is_crypto_instrument(iid, ticker):
+                debug["skipped"] += 1
+                if len(debug["samples"]) < 20:
+                    debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "skipped_crypto"})
+                return
+
+            # 1) Stooq
+            candles, cdbg = await stooq_get_daily_candles(ticker, count=candles_count)
+
+            # 2) Fallback to eToro candles if Stooq fails/no data
+            if (not candles) or (len(candles) < 80):
+                async with _ETORO_FALLBACK_SEM:
+                    ecandles, edbg = await etoro_get_daily_candles(iid, count=candles_count)
+
+                if ecandles and len(ecandles) >= 80:
+                    candles = ecandles
+                    cdbg = {"stooq": cdbg, "fallback": edbg}
                 else:
-                    status = "ok" if items else "empty"
-                if items:
-                    filings_fetched += 1
-                telemetry.append(
-                    FetchResult(sym, "sec_edgar", "filings", status, http_code, t.elapsed_ms, len(items)).to_dict()
-                )
-                results[sym]["filings"] = items  # remove if you want ultra-compact output
-            except Exception as e:
-                telemetry.append(
-                    FetchResult(sym, "sec_edgar", "filings", "error", None, t.elapsed_ms, 0, safe_err(e)).to_dict()
-                )
-                results[sym]["filings"] = []
+                    debug["failed"] += 1
+                    if len(debug["samples"]) < 20:
+                        debug["samples"].append({
+                            "instrumentID": iid,
+                            "ticker": ticker,
+                            "status": "no_candles",
+                            "cdbg": cdbg,
+                            "fallback": edbg
+                        })
+                    return
 
-    status_obj: Dict[str, Any] = {
+            closes = [normalize_number(c.get("close")) for c in candles]
+            vols = [normalize_number(c.get("volume")) for c in candles]
+            closes = [c for c in closes if isinstance(c, (int, float))]
+            vols = [v if isinstance(v, (int, float)) else 0.0 for v in vols]
+
+            if len(closes) < 80:
+                debug["failed"] += 1
+                if len(debug["samples"]) < 20:
+                    debug["samples"].append({"instrumentID": iid, "ticker": ticker, "status": "not_enough_closes"})
+                return
+
+            last_close = closes[-1]
+            rsi14 = rsi(closes, 14)
+            macd_line, macd_sig, macd_hist = macd(closes)
+            sma20 = sma(closes, 20)
+            sma50 = sma(closes, 50)
+            sma200 = sma(closes, 200)
+
+            above200 = None
+            if sma200 is not None:
+                above200 = last_close >= sma200
+
+            adv20 = None
+            dollar_adv20 = None
+            if len(vols) >= 20 and len(closes) >= 20:
+                v20 = vols[-20:]
+                c20 = closes[-20:]
+                adv20 = sum(v20) / 20.0
+                dollar_adv20 = sum(v * c for v, c in zip(v20, c20)) / 20.0
+
+            illiquid = False
+            if isinstance(dollar_adv20, (int, float)) and dollar_adv20 > 0:
+                illiquid = dollar_adv20 < 1_000_000
+
+            tech_map[iid] = {
+                "close": last_close,
+                "rsi14": rsi14,
+                "macd": macd_line,
+                "macd_signal": macd_sig,
+                "macd_hist": macd_hist,
+                "sma20": sma20,
+                "sma50": sma50,
+                "sma200": sma200,
+                "above_sma200": above200,
+                "adv20": adv20,
+                "dollar_adv20": dollar_adv20,
+                "illiquid": illiquid,
+                "candles_debug": cdbg,  # keep debug for diagnosis
+            }
+
+            debug["computed"] += 1
+            if len(debug["samples"]) < 6:
+                debug["samples"].append({
+                    "instrumentID": iid,
+                    "ticker": ticker,
+                    "rsi14": rsi14,
+                    "above_sma200": above200,
+                    "illiquid": illiquid
+                })
+
+    await asyncio.gather(*(one(i) for i in ids))
+    return tech_map, debug
+
+
+# ============================================================
+# PRESENTATION LAYER
+# ============================================================
+
+def build_portfolio_rows(
+    agg: List[Dict[str, Any]],
+    ticker_map: Dict[int, str],
+    tech_map: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    total_initial = sum(float(x.get("initialAmountInDollars") or 0) for x in agg) or 0.0
+    rows: List[Dict[str, Any]] = []
+
+    for a in agg:
+        iid = int(a["instrumentID"])
+        ticker = (ticker_map.get(iid) or str(iid)).strip()
+
+        if EXCLUDE_CRYPTO and is_crypto_instrument(iid, ticker):
+            continue
+
+        initial = normalize_number(a.get("initialAmountInDollars"))
+        unreal = normalize_number(a.get("unrealizedPnL"))
+
+        weight_pct = (initial / total_initial * 100.0) if (total_initial > 0 and initial and initial > 0) else None
+        pnl_pct = (unreal / initial * 100.0) if (initial and initial != 0 and unreal is not None) else None
+
+        tech = tech_map.get(iid)
+        if tech:
+            tag = tech_tags(tech)
+            tech_status = tag if tag else "OK"
+        else:
+            tech_status = "NO_TECH"
+
+        rows.append({
+            "ticker": ticker,
+            "instrumentID": str(iid),
+            "lots": str(a.get("lots", "")),
+            "weight_pct": f"{weight_pct:.2f}" if weight_pct is not None else "",
+            "pnl_pct": f"{pnl_pct:.2f}" if pnl_pct is not None else "",
+            "thesis_score": "",
+            "tech_status": tech_status,
+            "tech": tech or {},
+        })
+
+    return rows
+
+
+def deterministic_brief(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "No portfolio rows."
+
+    def fnum(x: Any) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    winners = sorted(rows, key=lambda r: fnum(r.get("pnl_pct")), reverse=True)[:5]
+    losers = sorted(rows, key=lambda r: fnum(r.get("pnl_pct")))[:5]
+
+    rsis = [(r["ticker"], r.get("tech", {}).get("rsi14")) for r in rows]
+    rsis_clean = [(t, float(v)) for (t, v) in rsis if isinstance(v, (int, float))]
+    overbought = sorted(rsis_clean, key=lambda x: x[1], reverse=True)[:5]
+    oversold = sorted(rsis_clean, key=lambda x: x[1])[:5]
+
+    below200 = [r["ticker"] for r in rows if r.get("tech", {}).get("above_sma200") is False][:12]
+    illq = [r["ticker"] for r in rows if r.get("tech", {}).get("illiquid")][:12]
+
+    lines = []
+    lines.append("DAILY BRIEF (read-only)")
+    lines.append("")
+    lines.append("Top winners (PnL%): " + ", ".join([f"{r['ticker']} {r.get('pnl_pct','')}" for r in winners]))
+    lines.append("Top losers  (PnL%): " + ", ".join([f"{r['ticker']} {r.get('pnl_pct','')}" for r in losers]))
+    lines.append("")
+    if overbought:
+        lines.append("RSI overbought: " + ", ".join([f"{t} {v:.1f}" for t, v in overbought]))
+    if oversold:
+        lines.append("RSI oversold:  " + ", ".join([f"{t} {v:.1f}" for t, v in oversold]))
+    lines.append("")
+    if below200:
+        lines.append("Below SMA200 (watch trend): " + ", ".join(below200))
+    if illq:
+        lines.append("Liquidity flags (low $ADV20): " + ", ".join(illq))
+    lines.append("")
+    lines.append("Notes: No buy/sell instructions. Use as a checklist for research.")
+    return "\n".join(lines)
+
+
+# ============================================================
+# DISCORD (optional)
+# ============================================================
+
+async def discord_notify(text: str) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(DISCORD_WEBHOOK_URL, json={"content": text})
+    except Exception:
+        pass
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    state = load_state()
+
+    last_update = state.get("date") or utc_now_iso()
+    material_events = state.get("material_events") or []
+    technical_exceptions = state.get("technical_exceptions") or []
+    action_required = state.get("action_required") or ["Run /tasks/daily to refresh data."]
+
+    portfolio = state.get("positions") or []
+    stats = state.get("stats") or {}
+    brief = state.get("brief") or ""
+    mapping = state.get("mapping") or {}
+    tech_debug = state.get("tech_debug") or {}
+
+    def bullets(items: List[str]) -> str:
+        lis = "".join([f"<li>{x}</li>" for x in items]) if items else "<li>None</li>"
+        return f"<ul>{lis}</ul>"
+
+    rows_html = ""
+    for r in portfolio[:300]:
+        rows_html += (
+            "<tr>"
+            f"<td>{r.get('ticker','')}</td>"
+            f"<td>{r.get('lots','')}</td>"
+            f"<td>{r.get('weight_pct','')}</td>"
+            f"<td>{r.get('pnl_pct','')}</td>"
+            f"<td>{r.get('thesis_score','')}</td>"
+            f"<td>{r.get('tech_status','')}</td>"
+            "</tr>"
+        )
+    if not rows_html:
+        rows_html = "<tr><td colspan='6'>No positions saved yet.</td></tr>"
+
+    html = f"""
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>My AI Investing Agent</title>
+        <style>
+          body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; margin: 24px; }}
+          table {{ border-collapse: collapse; width: 100%; }}
+          th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 14px; }}
+          th {{ background: #f5f5f5; text-align: left; }}
+          code {{ background: #f2f2f2; padding: 2px 6px; border-radius: 4px; }}
+        </style>
+      </head>
+      <body>
+        <h1>My AI Investing Agent</h1>
+        <p><b>Last update:</b> {last_update}</p>
+        <p><b>Universe:</b> {"Stocks only (crypto excluded)" if EXCLUDE_CRYPTO else "Mixed (crypto allowed)"}</p>
+        <p><b>Crypto filter:</b> instrumentId >= {CRYPTO_ID_MIN} OR ticker in denylist</p>
+        <p><b>eToro:</b> Lots = {stats.get("lots_count","")} | Unique instruments = {stats.get("unique_instruments_count","")}</p>
+        <p><b>Mapping cache:</b> {mapping.get("cached","")}/{mapping.get("total","")} cached (real tickers)</p>
+        <p><b>Technicals:</b> computed {tech_debug.get("computed","")}/{max(0, int(tech_debug.get("requested",0) or 0) - int(tech_debug.get("skipped",0) or 0))} (failed {tech_debug.get("failed","")}, skipped {tech_debug.get("skipped",0)})</p>
+
+        <h2>Material Events</h2>
+        {bullets(material_events)}
+
+        <h2>Technical Exceptions</h2>
+        {bullets(technical_exceptions)}
+
+        <h2>Action Required</h2>
+        {bullets(action_required)}
+
+        <p>Run <code>/tasks/daily</code> to refresh data.</p>
+
+        <h2>Daily Brief</h2>
+        <pre style="white-space: pre-wrap; background:#fafafa; border:1px solid #eee; padding:12px;">{brief or "No brief yet. Run /tasks/daily."}</pre>
+
+        <h2>Portfolio</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Ticker</th>
+              <th>Lots</th>
+              <th>Weight %</th>
+              <th>P&amp;L %</th>
+              <th>Thesis</th>
+              <th>Tech</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows_html}
+          </tbody>
+        </table>
+
+        <p>API: <code>/api/portfolio</code> • <code>/api/daily-brief</code> • Debug: <code>/debug/mapping-last</code> • <code>/debug/tech-last</code> • <code>/debug/candles?ticker=CCJ</code> • <code>/debug/etoro-candles?instrument_id=10721</code></p>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+
+@app.get("/tasks/daily")
+async def run_daily():
+    state = load_state()
+
+    material_events: List[str] = []
+    technical_exceptions: List[str] = []
+
+    material_events.append(
+        f"System check: OpenAI={'True' if bool(OPENAI_API_KEY) else 'False'}, "
+        f"Discord={'True' if bool(DISCORD_WEBHOOK_URL) else 'False'}, "
+        f"eToro keys={'True' if (bool(ETORO_API_KEY) and bool(ETORO_USER_KEY)) else 'False'}."
+    )
+
+    payload = await etoro_get_real_pnl()
+    raw_positions = extract_positions(payload)
+    agg_positions, stats = aggregate_positions_by_instrument(raw_positions)
+
+    material_events.append(
+        f"Pulled eToro successfully. Lots: {stats['lots_count']} | Unique instruments: {stats['unique_instruments_count']}"
+    )
+
+    instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
+
+    # 1) Mapping
+    ticker_cache, _map_dbg = await map_instrument_ids_to_tickers_search(instrument_ids, state)
+    mapping = state.get("mapping") or {"cached": 0, "total": len(instrument_ids)}
+    material_events.append(f"Resolved tickers: {mapping.get('cached',0)}/{mapping.get('total',len(instrument_ids))} (see /debug/mapping-last)")
+
+    # 2) Technicals
+    tech_map, tech_dbg = await compute_technicals_for_ids(instrument_ids, ticker_cache)
+    state["tech_debug"] = tech_dbg
+
+    if tech_dbg.get("failed", 0) > 0:
+        technical_exceptions.append(f"Candles missing for {tech_dbg.get('failed')} instruments (see /debug/tech-last).")
+    if tech_dbg.get("skipped", 0) > 0:
+        material_events.append(f"Skipped {tech_dbg.get('skipped')} instruments (no ticker / crypto excluded).")
+
+    # 3) Portfolio rows
+    portfolio_rows = build_portfolio_rows(agg_positions, ticker_cache, tech_map)
+
+    # 4) Brief
+    brief = deterministic_brief(portfolio_rows)
+
+    # 5) Discord notify (optional)
+    tech_done = tech_dbg.get("computed", 0)
+    tech_req = tech_dbg.get("requested", len(instrument_ids))
+    tech_skip = tech_dbg.get("skipped", 0)
+    tech_den = max(0, int(tech_req) - int(tech_skip))
+    await discord_notify(f"✅ Daily done | tickers {mapping.get('cached',0)}/{len(instrument_ids)} | tech {tech_done}/{tech_den}")
+
+    state.update({
+        "date": utc_now_iso(),
+        "material_events": material_events,
+        "technical_exceptions": technical_exceptions,
+        "action_required": ["None"],
+        "positions": portfolio_rows,
+        "stats": stats,
+        "brief": brief,
+        "mapping": mapping,
+    })
+    save_state(state)
+
+    return {
         "status": "ok",
-        "unique_instruments": len(set(symbols)),
-        "mapped_symbols": len(symbols),
-        "news_requested": news_requested,
-        "news_fetched": news_fetched,
-        "filings_requested": filings_requested,
-        "filings_fetched": filings_fetched,
-        "telemetry": telemetry,
-        "results": results,
+        "lots": stats["lots_count"],
+        "unique_instruments": stats["unique_instruments_count"],
+        "mapped_symbols": mapping.get("cached", 0),
+        "technicals_computed": tech_done,
+        "technicals_requested": tech_den,
+        "technicals_skipped": tech_skip,
     }
 
-    # Fail loudly if you requested news and got literally zero
-    if news_requested > 0 and news_fetched == 0:
-        status_obj["status"] = "error"
-        status_obj["error"] = "News fetch returned zero across all symbols. Check telemetry (http_code/status/error)."
 
-    # Filings can be legitimately zero if most symbols are non-US; still warn
-    if filings_requested > 0 and filings_fetched == 0:
-        status_obj.setdefault("warnings", []).append(
-            "Filings fetched zero across all symbols. Could be non-US holdings or SEC blocked. Check telemetry and SEC_USER_AGENT."
-        )
-
-    # Write output silently
-    out_path = os.getenv("OUTPUT_PATH", "agent_output.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(status_obj, f, ensure_ascii=False, indent=2)
-
-    return status_obj
+@app.get("/api/portfolio")
+async def api_portfolio():
+    state = load_state()
+    return JSONResponse({
+        "date": state.get("date") or utc_now_iso(),
+        "stats": state.get("stats") or {},
+        "mapping": state.get("mapping") or {},
+        "tech_debug": state.get("tech_debug") or {},
+        "positions": state.get("positions") or [],
+    })
 
 
-if __name__ == "__main__":
-    # Silent by default: no prints.
-    # If something goes wrong, raise so your runner/CI sees it.
-    obj = run_agent()
-    if obj.get("status") == "error":
-        raise SystemExit(obj.get("error", "Agent failed"))
+@app.get("/api/daily-brief")
+async def api_daily_brief():
+    state = load_state()
+    return JSONResponse({
+        "date": state.get("date") or utc_now_iso(),
+        "material_events": state.get("material_events") or [],
+        "technical_exceptions": state.get("technical_exceptions") or [],
+        "action_required": state.get("action_required") or [],
+        "brief": state.get("brief") or "",
+        "stats": state.get("stats") or {},
+        "mapping": state.get("mapping") or {},
+        "tech_debug": state.get("tech_debug") or {},
+    })
+
+
+@app.get("/debug/mapping-last")
+async def debug_mapping_last():
+    state = load_state()
+    return JSONResponse(state.get("mapping_last_debug") or {"note": "Run /tasks/daily first."})
+
+
+@app.get("/debug/tech-last")
+async def debug_tech_last():
+    state = load_state()
+    return JSONResponse(state.get("tech_debug") or {"note": "Run /tasks/daily first."})
+
+
+@app.get("/debug/candles")
+async def debug_candles(
+    ticker: str = Query(..., description="Try: CCJ, ASML, CEG, ALB, STEM, RKLB"),
+):
+    candles, dbg = await stooq_get_daily_candles(ticker, count=180)
+    sample = candles[-3:] if candles else []
+    return JSONResponse({"ticker": ticker, "debug": dbg, "rows": len(candles), "sample": sample})
+
+
+@app.get("/debug/etoro-candles")
+async def debug_etoro_candles(
+    instrument_id: int = Query(..., description="numeric instrumentID from your table"),
+):
+    candles, dbg = await etoro_get_daily_candles(instrument_id, count=260)
+    sample = candles[-3:] if candles else []
+    return JSONResponse({"instrumentId": instrument_id, "debug": dbg, "rows": len(candles), "sample": sample})
+
+
+@app.post("/admin/seed-mapping")
+async def admin_seed_mapping(request: Request):
+    """
+    If some instrumentIDs never map via /search, seed them once.
+    POST JSON like: {"9031":"STEM","9085":"RKLB"}
+    Add header x-admin-token if ADMIN_TOKEN is set.
+    """
+    require_admin(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be JSON object: {instrumentId: ticker}")
+
+    state = load_state()
+    cache_raw = state.get("ticker_cache") or {}
+
+    seeded = 0
+    for k, v in body.items():
+        try:
+            iid = int(k)
+        except Exception:
+            continue
+        sym = str(v).strip()
+        if sym:
+            cache_raw[str(iid)] = sym
+            seeded += 1
+
+    state["ticker_cache"] = cache_raw
+    save_state(state)
+    return {"status": "ok", "seeded": seeded, "note": "Run /tasks/daily again."}
