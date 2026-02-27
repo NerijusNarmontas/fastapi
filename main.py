@@ -1,29 +1,36 @@
 # main.py
-# Changes based on your feedback:
-# ✅ Adds your manual classifications:
-#   - Crypto: SEI WLD PYTH HBAR CRO HYPE RPL ARBE (+ your existing CRYPTO_TICKERS)
-#   - Energy: CEG (Energy)
-#   - Space: BKSY FLY SPIR (Space / Space tech)
-#   - Rare metals: ABAT USAR TMC (Rare metals)
-#   - Nuclear: FERMI LTBR BOE.ASX (Nuclear)
-#   - Tech: CRWV S.US INTC (Tech)
-#   - Quantum: ARQQ RGTI (Quantum)
-#   - Miners: RGLD (Miners)
+# Single-file FastAPI app that:
+# - Pulls eToro REAL PnL + portfolio positions
+# - Aggregates by instrumentID
+# - Maps instrumentID -> ticker via eToro /market-data/search
+# - Separates Crypto vs Stocks (crypto list includes your tickers)
+# - Categorizes stocks into industry-like groups (your manual mappings included)
+# - CLEAN dashboard (white background / black text)
+# - News/SEC links shown ONLY when you click a ticker:
+#     /t/{TICKER} opens a new page with cached News + SEC links
+# - Adds a tiny superscript "tv" link next to each ticker to open TradingView live
+# - Fetches FREE news (Google News RSS) + SEC links (cached by /tasks/daily)
 #
-# ✅ Cleaner UI:
-#   - White screen / black text
-#   - Category sections are COLLAPSIBLE (<details>)
-#   - Each category shows ONE compact table
-#   - News shown AFTER each category but compact:
-#       - one unified list (top headlines across tickers)
-#       - not separate huge cards per ticker
-#   - SEC shown as compact list (latest per category)
+# Railway startCommand:
+#   hypercorn main:app --bind "0.0.0.0:$PORT"
 #
-# ✅ Categories now behave more like "industries" (your “industry groups”) instead of broad sectors:
-#   - Energy / Gas / Nuclear / Space / Space Tech / Rare Metals / Miners / Tech / AI Infra / Quantum / Other
+# Railway Variables REQUIRED:
+#   ETORO_API_KEY=...
+#   ETORO_USER_KEY=...
+#   SEC_UA=YourName AppName (email@domain.com)
 #
-# NOTE: OpenAI/Gemini brief remains optional; you can disable by not setting OPENAI_API_KEY.
-#       (If you later swap to Gemini, only the brief function changes.)
+# Optional:
+#   OPENAI_API_KEY=... (optional AI brief; safe to leave empty)
+#   CRYPTO_EXCLUDE=W
+#   CRYPTO_TICKERS=... (extend list)
+#   CRYPTO_INSTRUMENT_IDS=100000
+#   STATE_PATH=/tmp/investing_agent_state.json
+#   NEWS_PER_TICKER=6
+#   SEC_PER_TICKER=6
+#   DEFAULT_UA=...
+#   ETORO_REAL_PNL_URL=...
+#   ETORO_SEARCH_URL=...
+#   CIK_MAP={"AAPL":"0000320193"}  # optional for richer SEC lists (CIK-based Atom feed)
 
 import os
 import re
@@ -74,21 +81,23 @@ DEFAULT_UA = os.getenv(
 SEC_UA = os.getenv("SEC_UA", "").strip()
 CIK_MAP_JSON = os.getenv("CIK_MAP", "").strip()
 
-# "Collision excludes" (kept)
+# kept: ticker collision excludes (default W)
 CRYPTO_EXCLUDE = set(
     s.strip().upper() for s in os.getenv("CRYPTO_EXCLUDE", "W").split(",") if s.strip()
 )
 
-# crypto list (you can extend via env)
+# crypto list (includes your crypto tickers; extendable via env)
 CRYPTO_TICKERS = set(
     s.strip().upper()
     for s in os.getenv(
         "CRYPTO_TICKERS",
-        "BTC,ETH,SOL,AVAX,OP,ARB,JTO,RUNE,W,EIGEN,STRK,ONDO,SEI,WLD,PYTH,HBAR,CRO,HYPE,RPL,ARBE",
+        "BTC,ETH,SOL,AVAX,OP,ARB,JTO,RUNE,W,EIGEN,STRK,ONDO,"
+        "SEI,WLD,PYTH,HBAR,CRO,HYPE,RPL,ARBE",
     ).split(",")
     if s.strip()
 )
 
+# optional instrumentID heuristic for crypto (BTC on eToro often 100000)
 CRYPTO_INSTRUMENT_IDS = set(
     int(x.strip())
     for x in os.getenv("CRYPTO_INSTRUMENT_IDS", "100000").split(",")
@@ -98,18 +107,13 @@ CRYPTO_INSTRUMENT_IDS = set(
 NEWS_PER_TICKER = int(os.getenv("NEWS_PER_TICKER", "6"))
 SEC_PER_TICKER = int(os.getenv("SEC_PER_TICKER", "6"))
 
-# NEW: compact mode limits (reduce bulk)
-CATEGORY_MAX_TICKERS_FOR_NEWS = int(os.getenv("CATEGORY_MAX_TICKERS_FOR_NEWS", "10"))
-CATEGORY_MAX_NEWS_ITEMS = int(os.getenv("CATEGORY_MAX_NEWS_ITEMS", "12"))
-CATEGORY_MAX_SEC_ITEMS = int(os.getenv("CATEGORY_MAX_SEC_ITEMS", "10"))
-
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "25"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "10"))
 
 # ----------------------------
-# "Industry-like" categories (manual overrides first)
+# Industry-like categories (manual overrides first)
 # ----------------------------
-# Format: TICKER -> (IndustryGroup, SubGroup)
+# Your explicit mapping + core portfolio examples
 CATEGORY_OVERRIDES: Dict[str, Tuple[str, str]] = {
     # Your explicit mapping
     "CEG": ("Energy", "Power / Nuclear-linked"),
@@ -130,7 +134,7 @@ CATEGORY_OVERRIDES: Dict[str, Tuple[str, str]] = {
     "ARQQ": ("Quantum", "Quantum / Security"),
     "RGTI": ("Quantum", "Quantum Computing"),
 
-    # Core energy portfolio examples (keep these so grouping stays clean)
+    # Energy / gas / midstream examples (keep grouping clean)
     "EQT": ("Gas", "Gas E&P"),
     "CTRA": ("Gas", "Gas E&P"),
     "RRC": ("Gas", "Gas E&P"),
@@ -151,14 +155,12 @@ CATEGORY_OVERRIDES: Dict[str, Tuple[str, str]] = {
     "OKLO": ("Nuclear", "SMR"),
 }
 
-# energy thesis (tracked, not printed)
 ENERGY_THESIS = {
     "focus": ["post-shale peak", "capital discipline", "FCF/ROIC", "gas tightness", "geopolitics", "nuclear buildout"],
     "avoid": ["refining"],
     "preferred": ["gas", "midstream", "uranium", "nuclear fuel", "smrs"],
 }
 
-# category order (clean)
 CATEGORY_ORDER = [
     "Gas",
     "Energy",
@@ -171,7 +173,6 @@ CATEGORY_ORDER = [
     "Rare Metals",
     "Miners",
     "Other",
-    "Crypto",
 ]
 
 # ----------------------------
@@ -302,23 +303,36 @@ def categorize_ticker(ticker: str) -> Tuple[str, str]:
         return CATEGORY_OVERRIDES[t]
 
     # conservative fallbacks
-    if t in ("CCJ", "UEC", "LEU", "SMR", "OKLO", "LTBR"):
+    if t in ("CCJ", "UEC", "LEU", "SMR", "OKLO", "LTBR", "FERMI", "BOE.ASX"):
         return ("Nuclear", "Nuclear")
     if t in ("ARQQ", "RGTI", "IONQ", "QBTS"):
         return ("Quantum", "Quantum")
     if t in ("BKSY", "SPIR", "RDW", "FLY"):
         return ("Space", "Space")
-    if t in ("AU", "NEM", "KGC", "SBSW", "RGLD", "MP"):
+    if t in ("RGLD", "AU", "NEM", "KGC", "SBSW", "MP"):
         return ("Miners", "Miners")
     if t in ("ABAT", "USAR", "TMC", "ALB"):
         return ("Rare Metals", "Materials")
+    if t in ("INTC", "S.US", "CRWV"):
+        return ("Tech", "Tech")
+    if t.endswith(".US") and t.startswith("AR"):
+        return ("Gas", "Gas")
     return ("Other", "Unclassified")
+
+
+def ordered_industries(groups: Dict[str, Any]) -> List[str]:
+    present = set(groups.keys())
+    out = [x for x in CATEGORY_ORDER if x in present]
+    for k in sorted(present):
+        if k not in out:
+            out.append(k)
+    return out
 
 
 def group_rows(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Returns:
-      groups: { "Industry": { "subgroups": {sub: [rows]}, "rows": [rows], "tickers": [...]} }
+      groups: { industry: {"rows":[...], "tickers":[...]} }
       crypto_rows: [rows]
     """
     groups: Dict[str, Dict[str, Any]] = {}
@@ -336,32 +350,30 @@ def group_rows(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], L
             crypto_rows.append(r)
             continue
 
-        industry, sub = categorize_ticker(t)
+        industry, _sub = categorize_ticker(t)
         if industry not in groups:
-            groups[industry] = {"subgroups": defaultdict(list), "rows": [], "tickers": []}
-        groups[industry]["subgroups"][sub].append(r)
+            groups[industry] = {"rows": [], "tickers": []}
         groups[industry]["rows"].append(r)
         if t:
             groups[industry]["tickers"].append(t)
 
-    # sort rows by weight desc
     for industry in groups:
         groups[industry]["rows"].sort(key=lambda x: float(x.get("weight_pct") or 0), reverse=True)
         groups[industry]["tickers"] = list(dict.fromkeys(groups[industry]["tickers"]))
 
     crypto_rows.sort(key=lambda x: float(x.get("weight_pct") or 0), reverse=True)
-
     return groups, crypto_rows
 
 
-def ordered_industries(groups: Dict[str, Any]) -> List[str]:
-    present = set(groups.keys())
-    out = [x for x in CATEGORY_ORDER if x in present]
-    # add any unknown at end
-    for k in sorted(present):
-        if k not in out:
-            out.append(k)
-    return out
+def tradingview_url(ticker: str, exchange: str = "") -> str:
+    """
+    Prefer chart URL when exchange is known, otherwise fallback to symbol page.
+    """
+    t = normalize_ticker(ticker)
+    ex = (exchange or "").strip().upper()
+    if ex:
+        return f"https://www.tradingview.com/chart/?symbol={ex}:{t}"
+    return f"https://www.tradingview.com/symbols/{t}/"
 
 
 # ----------------------------
@@ -412,15 +424,30 @@ def _extract_ticker_from_search_item(item: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_exchange_from_search_item(item: Dict[str, Any]) -> str:
+    # Field names vary; try common possibilities.
+    for k in ("exchange", "exchangeName", "exchangeCode", "marketName", "market"):
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
 async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict[int, str], Dict[str, Any]]:
+    """
+    instrumentId -> ticker, and best-effort meta (exchange) for TradingView links.
+    Returns: ticker_map, debug (includes debug["instrument_meta"]).
+    """
     ids = sorted(set(int(x) for x in instrument_ids if x is not None))
     out: Dict[int, str] = {}
-    debug = {"requested": len(ids), "mapped": 0, "failed": 0, "samples": []}
+    instrument_meta: Dict[int, Dict[str, str]] = {}
+    debug: Dict[str, Any] = {"requested": len(ids), "mapped": 0, "failed": 0, "samples": []}
 
     sem = asyncio.Semaphore(10)
 
     async def one(iid: int):
         async with sem:
+            # Try instrumentId filter
             status, data = await etoro_search({"instrumentId": str(iid), "pageSize": "5", "pageNumber": "1"})
             items = data.get("items") if isinstance(data, dict) else None
             if isinstance(items, list) and items:
@@ -430,11 +457,14 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict
                     t = _extract_ticker_from_search_item(it)
                     if t:
                         out[iid] = t
+                        ex = _extract_exchange_from_search_item(it)
+                        instrument_meta[iid] = {"exchange": ex}
                         debug["mapped"] += 1
                         if len(debug["samples"]) < 10:
-                            debug["samples"].append({"instrumentID": iid, "ticker": t, "via": "instrumentId", "status": status})
+                            debug["samples"].append({"instrumentID": iid, "ticker": t, "exchange": ex, "via": "instrumentId", "status": status})
                         return
 
+            # Fallback: internalInstrumentId filter
             status2, data2 = await etoro_search({"internalInstrumentId": str(iid), "pageSize": "5", "pageNumber": "1"})
             items2 = data2.get("items") if isinstance(data2, dict) else None
             if isinstance(items2, list) and items2:
@@ -444,9 +474,11 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict
                     t = _extract_ticker_from_search_item(it)
                     if t:
                         out[iid] = t
+                        ex = _extract_exchange_from_search_item(it)
+                        instrument_meta[iid] = {"exchange": ex}
                         debug["mapped"] += 1
                         if len(debug["samples"]) < 10:
-                            debug["samples"].append({"instrumentID": iid, "ticker": t, "via": "internalInstrumentId", "status": status2})
+                            debug["samples"].append({"instrumentID": iid, "ticker": t, "exchange": ex, "via": "internalInstrumentId", "status": status2})
                         return
 
             debug["failed"] += 1
@@ -454,6 +486,7 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict
                 debug["samples"].append({"instrumentID": iid, "status": "no_match_or_no_ticker"})
 
     await asyncio.gather(*(one(i) for i in ids))
+    debug["instrument_meta"] = instrument_meta
     return out, debug
 
 
@@ -469,7 +502,7 @@ def build_portfolio_rows(agg: List[Dict[str, Any]], ticker_map: Dict[int, str]) 
         ticker_raw = ticker_map.get(iid) or str(iid)
         ticker = normalize_ticker(ticker_raw)
 
-        # Collision exclude for non-crypto only
+        # collision exclude for non-crypto only
         if ticker in CRYPTO_EXCLUDE and ticker not in CRYPTO_TICKERS:
             continue
 
@@ -523,7 +556,7 @@ def resume_news(title: str) -> str:
         tags.append("Earnings / guidance")
     if any(k in t for k in ["acquire", "acquisition", "merger", "buyout", "takeover"]):
         tags.append("M&A")
-    if any(k in t for k in ["offering", "private placement", "convertible", "debt", "notes"]):
+    if any(k in t for k in ["offering", "private placement", "convertible", "debt", "notes", "atm", "shelf"]):
         tags.append("Financing")
     if any(k in t for k in ["contract", "award", "partnership", "collaboration"]):
         tags.append("Commercial deal")
@@ -592,7 +625,7 @@ def resume_sec(form: str) -> str:
         return "Quarterly report."
     if f == "10-K":
         return "Annual report."
-    if f in ("S-1", "F-1"):
+    if f in ("S-1", "F-1", "424B", "424B2", "424B3", "424B5"):
         return "Registration / offering."
     return "Filing update."
 
@@ -644,7 +677,7 @@ async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[D
             if not title or not link or link in seen:
                 continue
             seen.add(link)
-            m = re.search(r"\b(8-K|10-Q|10-K|S-1|F-1)\b", title, re.I)
+            m = re.search(r"\b(8-K|10-Q|10-K|S-1|F-1|424B\d*)\b", title, re.I)
             form = (m.group(1).upper() if m else "Filing")
             out.append({
                 "ticker": ticker,
@@ -658,7 +691,6 @@ async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[D
                 break
         return out
 
-    # fallback link
     search_link = f"https://www.sec.gov/edgar/search/#/q={quote_plus(ticker)}&sort=desc"
     return [{
         "ticker": ticker,
@@ -671,7 +703,7 @@ async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[D
 
 
 # ----------------------------
-# Optional OpenAI brief (keep as-is; you can disable by no key)
+# Optional OpenAI brief (disable by leaving OPENAI_API_KEY empty)
 # ----------------------------
 async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
     if not OPENAI_API_KEY:
@@ -704,7 +736,7 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
 
 
 # ----------------------------
-# Daily Task: eToro -> tickers -> news + sec
+# Daily Task: tickers -> news + sec
 # ----------------------------
 async def compute_news_and_sec(tickers: List[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     sem = asyncio.Semaphore(CONCURRENCY)
@@ -725,40 +757,6 @@ async def compute_news_and_sec(tickers: List[str]) -> Tuple[Dict[str, Any], Dict
         await asyncio.gather(*(do_sec(t) for t in tickers))
 
     return news_cache, sec_cache
-
-
-def _compact_merge_news(news_cache: Dict[str, List[Dict[str, Any]]], tickers: List[str], limit: int) -> List[Dict[str, Any]]:
-    """
-    Merge news across many tickers into one list, dedupe by link.
-    Keeps order by ticker order, then RSS order.
-    """
-    seen = set()
-    out: List[Dict[str, Any]] = []
-    for t in tickers:
-        for it in (news_cache.get(t) or []):
-            link = (it.get("link") or "").strip()
-            if not link or link in seen:
-                continue
-            seen.add(link)
-            out.append(it)
-            if len(out) >= limit:
-                return out
-    return out
-
-
-def _compact_merge_sec(sec_cache: Dict[str, List[Dict[str, Any]]], tickers: List[str], limit: int) -> List[Dict[str, Any]]:
-    seen = set()
-    out: List[Dict[str, Any]] = []
-    for t in tickers:
-        for it in (sec_cache.get(t) or []):
-            link = (it.get("link") or "").strip()
-            if not link or link in seen:
-                continue
-            seen.add(link)
-            out.append(it)
-            if len(out) >= limit:
-                return out
-    return out
 
 
 # ----------------------------
@@ -787,9 +785,7 @@ async def dashboard():
 
     groups = state.get("groups") or {}          # {industry: {"rows":[], "tickers":[]}}
     crypto_rows = state.get("crypto_rows") or []
-
-    news_cache = state.get("news_cache") or {}
-    sec_cache = state.get("sec_cache") or {}
+    instrument_meta = state.get("instrument_meta") or {}  # {instrumentID: {"exchange": "..."}}
 
     def bullets(items: List[str]) -> str:
         lis = "".join([f"<li>{html_escape(x)}</li>" for x in items]) if items else "<li>None</li>"
@@ -803,9 +799,25 @@ async def dashboard():
                    "<th>Ticker</th><th>Lots</th><th>Weight %</th><th>P&amp;L %</th>"
                    "</tr></thead><tbody>")
         for r in rows[:200]:
+            t = r.get("ticker", "")
+            iid = 0
+            try:
+                iid = int(r.get("instrumentID") or 0)
+            except Exception:
+                iid = 0
+
+            ex = (instrument_meta.get(str(iid)) or instrument_meta.get(iid) or {}).get("exchange", "")
+            tv = tradingview_url(t, ex)
+
             out.append(
                 "<tr>"
-                f"<td>{html_escape(r.get('ticker',''))}</td>"
+                "<td>"
+                f"<a href='/t/{html_escape(t)}' target='_blank' rel='noopener noreferrer'>{html_escape(t)}</a>"
+                f"<sup style='margin-left:6px;'>"
+                f"<a href='{html_escape(tv)}' target='_blank' rel='noopener noreferrer' "
+                f"title='Open in TradingView' style='font-size:11px; text-decoration:none;'>tv</a>"
+                f"</sup>"
+                "</td>"
                 f"<td>{html_escape(r.get('lots',''))}</td>"
                 f"<td>{html_escape(r.get('weight_pct',''))}</td>"
                 f"<td>{html_escape(r.get('pnl_pct',''))}</td>"
@@ -814,62 +826,13 @@ async def dashboard():
         out.append("</tbody></table>")
         return "".join(out)
 
-    def render_compact_news(items: List[Dict[str, Any]]) -> str:
-        if not items:
-            return "<div class='muted'>No news cached.</div>"
-        out = ["<ul class='news'>"]
-        for it in items:
-            out.append(
-                "<li>"
-                f"<a href='{html_escape(it.get('link',''))}' target='_blank' rel='noopener noreferrer'>{html_escape(it.get('title',''))}</a>"
-                f"<span class='meta'> — {html_escape(it.get('source',''))}</span>"
-                f"<span class='tag'> {html_escape(it.get('resume',''))}</span>"
-                "</li>"
-            )
-        out.append("</ul>")
-        return "".join(out)
-
-    def render_compact_sec(items: List[Dict[str, Any]]) -> str:
-        if not items:
-            return "<div class='muted'>No SEC cached.</div>"
-        out = ["<ul class='news'>"]
-        for it in items:
-            out.append(
-                "<li>"
-                f"<span class='badge'>{html_escape(it.get('form',''))}</span>"
-                f"<a href='{html_escape(it.get('link',''))}' target='_blank' rel='noopener noreferrer'>{html_escape(it.get('title',''))}</a>"
-                f"<span class='meta'> — {html_escape(it.get('resume',''))}</span>"
-                "</li>"
-            )
-        out.append("</ul>")
-        return "".join(out)
-
-    # Build clean category sections (collapsible)
     category_html = ""
     for industry in ordered_industries(groups):
-        g = groups.get(industry) or {}
-        rows = g.get("rows") or []
-        tickers = g.get("tickers") or []
-        tickers = tickers[:CATEGORY_MAX_TICKERS_FOR_NEWS]
-
-        merged_news = _compact_merge_news(news_cache, tickers, CATEGORY_MAX_NEWS_ITEMS)
-        merged_sec = _compact_merge_sec(sec_cache, tickers, CATEGORY_MAX_SEC_ITEMS)
-
-        header_line = f"{industry} <span class='muted'>({len(rows)} positions)</span>"
+        rows = (groups.get(industry) or {}).get("rows") or []
         category_html += f"""
         <details class="section" open>
-          <summary>{header_line}</summary>
-          <div class="block">
-            {render_table(rows)}
-          </div>
-          <div class="block">
-            <div class="h">News</div>
-            {render_compact_news(merged_news)}
-          </div>
-          <div class="block">
-            <div class="h">SEC</div>
-            {render_compact_sec(merged_sec)}
-          </div>
+          <summary>{html_escape(industry)} <span class="muted">({len(rows)} positions)</span></summary>
+          <div class="block">{render_table(rows)}</div>
         </details>
         """
 
@@ -878,10 +841,8 @@ async def dashboard():
         crypto_html = f"""
         <details class="section">
           <summary>Crypto <span class="muted">({len(crypto_rows)} positions)</span></summary>
-          <div class="block">
-            {render_table(crypto_rows)}
-          </div>
-          <div class="muted">Crypto news/SEC not fetched by default.</div>
+          <div class="block">{render_table(crypto_rows)}</div>
+          <div class="muted">Crypto news/SEC not fetched by default. Click ticker for its links page, and “tv” for TradingView.</div>
         </details>
         """
 
@@ -899,9 +860,9 @@ async def dashboard():
           }}
           a {{ color: #0b57d0; text-decoration:none; }}
           a:hover {{ text-decoration:underline; }}
-
           .muted {{ color:#555; }}
           .wrap {{ max-width: 1100px; }}
+
           .topline {{ display:flex; gap:18px; flex-wrap:wrap; align-items:baseline; }}
           code {{ background:#f3f3f3; border:1px solid #ddd; padding:2px 6px; border-radius:8px; }}
 
@@ -922,40 +883,7 @@ async def dashboard():
             font-size: 16px;
           }}
           .block {{ margin-top: 10px; }}
-          .h {{
-            font-weight: 700;
-            margin: 8px 0 6px;
-            font-size: 13px;
-            text-transform: uppercase;
-            letter-spacing: .08em;
-            color: #333;
-          }}
-          ul.news {{
-            margin: 6px 0 0 18px;
-            padding: 0;
-          }}
-          ul.news li {{
-            margin: 6px 0;
-            line-height: 1.25;
-            font-size: 14px;
-          }}
-          .meta {{
-            color:#555;
-            font-size: 12px;
-          }}
-          .tag {{
-            color:#222;
-            font-size: 12px;
-          }}
-          .badge {{
-            display:inline-block;
-            font-size:11px;
-            padding:2px 8px;
-            border-radius:999px;
-            border:1px solid #ddd;
-            background:#f5f5f5;
-            margin-right:6px;
-          }}
+
           pre {{
             white-space: pre-wrap;
             background:#f7f7f7;
@@ -992,7 +920,131 @@ async def dashboard():
           <h2>Stocks (industry groups)</h2>
           {category_html if category_html else "<div class='muted'>No categorized stock positions yet. Run /tasks/daily.</div>"}
 
+          <p class="muted">Click ticker for links page (News + SEC). Click <b>tv</b> to open TradingView.</p>
           <p class="muted">API: <code>/api/portfolio</code> • <code>/api/news</code> • <code>/api/sec</code> • <code>/api/daily-brief</code> • Debug: <code>/debug/mapping-last</code></p>
+        </div>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+
+@app.get("/t/{ticker}", response_class=HTMLResponse)
+async def ticker_page(ticker: str):
+    state = load_state()
+    t = normalize_ticker(ticker)
+
+    news_cache = state.get("news_cache") or {}
+    sec_cache = state.get("sec_cache") or {}
+
+    news_items = (news_cache.get(t) or [])[:NEWS_PER_TICKER]
+    sec_items = (sec_cache.get(t) or [])[:SEC_PER_TICKER]
+
+    tv = tradingview_url(t, "")
+
+    def render_news():
+        if not news_items:
+            return "<div class='muted'>No news cached for this ticker. Run /tasks/daily.</div>"
+        out = ["<ul class='lst'>"]
+        for it in news_items:
+            out.append(
+                "<li>"
+                f"<a href='{html_escape(it.get('link',''))}' target='_blank' rel='noopener noreferrer'>{html_escape(it.get('title',''))}</a>"
+                f"<div class='meta'>{html_escape(it.get('source',''))} · {html_escape(it.get('published',''))}</div>"
+                f"<div class='tag'>{html_escape(it.get('resume',''))}</div>"
+                "</li>"
+            )
+        out.append("</ul>")
+        return "".join(out)
+
+    def render_sec():
+        if not sec_items:
+            return "<div class='muted'>No SEC cached for this ticker. (CIK_MAP improves this.)</div>"
+        out = ["<ul class='lst'>"]
+        for it in sec_items:
+            out.append(
+                "<li>"
+                f"<span class='badge'>{html_escape(it.get('form',''))}</span>"
+                f"<a href='{html_escape(it.get('link',''))}' target='_blank' rel='noopener noreferrer'>{html_escape(it.get('title',''))}</a>"
+                f"<div class='meta'>{html_escape(it.get('filed',''))}</div>"
+                f"<div class='tag'>{html_escape(it.get('resume',''))}</div>"
+                "</li>"
+            )
+        out.append("</ul>")
+        return "".join(out)
+
+    html = f"""
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>{html_escape(t)} — Links</title>
+        <style>
+          body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial;
+            margin: 24px;
+            background: #ffffff;
+            color: #000000;
+          }}
+          a {{ color: #0b57d0; text-decoration:none; }}
+          a:hover {{ text-decoration:underline; }}
+          .muted {{ color:#555; }}
+          .wrap {{ max-width: 1000px; }}
+          .top {{ display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }}
+          .btn {{
+            display:inline-block;
+            padding:6px 10px;
+            border:1px solid #ddd;
+            border-radius:10px;
+            background:#f5f5f5;
+            color:#111;
+            font-size:13px;
+          }}
+          .card {{
+            border:1px solid #ddd;
+            border-radius:12px;
+            padding:12px;
+            margin:12px 0;
+          }}
+          .h {{
+            font-weight:800;
+            font-size:13px;
+            text-transform:uppercase;
+            letter-spacing:.08em;
+            margin-bottom:8px;
+          }}
+          ul.lst {{ margin: 8px 0 0 18px; padding:0; }}
+          ul.lst li {{ margin: 10px 0; line-height:1.25; }}
+          .meta {{ font-size:12px; color:#555; margin-top:2px; }}
+          .tag {{ font-size:12px; color:#222; margin-top:2px; }}
+          .badge {{
+            display:inline-block;
+            font-size:11px;
+            padding:2px 8px;
+            border-radius:999px;
+            border:1px solid #ddd;
+            background:#f5f5f5;
+            margin-right:6px;
+          }}
+        </style>
+      </head>
+      <body>
+        <div class="wrap">
+          <div class="top">
+            <h1 style="margin:0;">{html_escape(t)}</h1>
+            <a class="btn" href="/" target="_self">Back</a>
+            <a class="btn" href="{html_escape(tv)}" target="_blank" rel="noopener noreferrer">Open TradingView</a>
+            <span class="muted">Last update: {html_escape(state.get("date") or utc_now_iso())}</span>
+          </div>
+
+          <div class="card">
+            <div class="h">News</div>
+            {render_news()}
+          </div>
+
+          <div class="card">
+            <div class="h">SEC</div>
+            {render_sec()}
+          </div>
         </div>
       </body>
     </html>
@@ -1034,6 +1086,7 @@ async def run_daily():
             "sec_cache": {},
             "groups": {},
             "crypto_rows": [],
+            "instrument_meta": {},
             "energy_thesis": ENERGY_THESIS,
         })
         save_state(state)
@@ -1041,34 +1094,25 @@ async def run_daily():
 
     instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
 
-    # Map instrumentId -> ticker via Search endpoint
+    # Map instrumentId -> ticker (+ exchange meta)
     ticker_map, map_debug = await map_instrument_ids_to_tickers(instrument_ids)
     material_events.append(f"Mapped tickers via search: {map_debug['mapped']}/{map_debug['requested']}")
 
     portfolio_rows = build_portfolio_rows(agg_positions, ticker_map)
 
-    # Group (industry-like) + crypto
+    # Group industry + crypto
     grouped, crypto_rows = group_rows(portfolio_rows)
 
-    # Tickers for news/sec: stocks only
+    # tickers for news/sec: stocks only (crypto excluded)
     stock_tickers_for_news: List[str] = []
     for industry in grouped:
         stock_tickers_for_news.extend(grouped[industry].get("tickers") or [])
     stock_tickers_for_news = list(dict.fromkeys(stock_tickers_for_news))
 
-    # Fetch news + sec (stocks only)
     news_cache, sec_cache = await compute_news_and_sec(stock_tickers_for_news)
 
-    technical_exceptions.append("Next: RSI/MACD/MAs/Volume/ADV + liquidity flags.")
+    technical_exceptions.append("Next: Monthly return, RSI, 200DMA, ATR%, liquidity + strict-mode fundamentals.")
     ai_brief = await generate_openai_brief(portfolio_rows) if portfolio_rows else "No positions."
-
-    # For state, keep groups as a compact structure
-    groups_for_state: Dict[str, Any] = {}
-    for industry, g in grouped.items():
-        groups_for_state[industry] = {
-            "rows": g.get("rows") or [],
-            "tickers": g.get("tickers") or [],
-        }
 
     state.update({
         "date": utc_now_iso(),
@@ -1080,10 +1124,11 @@ async def run_daily():
         "ai_brief": ai_brief,
         "mapping": {"requested": map_debug["requested"], "mapped": map_debug["mapped"]},
         "mapping_last_debug": map_debug,
+        "instrument_meta": map_debug.get("instrument_meta") or {},
         "news_cache": news_cache,
         "sec_cache": sec_cache,
         "tickers": stock_tickers_for_news,
-        "groups": groups_for_state,
+        "groups": grouped,
         "crypto_rows": crypto_rows,
         "energy_thesis": ENERGY_THESIS,
     })
@@ -1111,6 +1156,7 @@ async def api_portfolio():
         "tickers": state.get("tickers") or [],
         "groups": state.get("groups") or {},
         "crypto_rows": state.get("crypto_rows") or [],
+        "instrument_meta": state.get("instrument_meta") or {},
     })
 
 
