@@ -400,6 +400,60 @@ async def run_daily_refresh() -> Dict[str, Any]:
 
 
 app = FastAPI(title=APP_NAME)
+import os
+import httpx
+from fastapi.responses import PlainTextResponse
+
+ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()
+ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip()
+
+# If you already had these in your old code, keep the same endpoints you used.
+ETORO_POSITIONS_URL = os.getenv(
+    "ETORO_POSITIONS_URL",
+    "https://api.etorostatic.com/sapi/trading/positions",  # placeholder: use YOUR working endpoint
+)
+
+@app.get("/debug/tickers", response_class=PlainTextResponse)
+async def debug_tickers() -> str:
+    """
+    Returns: comma-separated STOCK tickers (crypto excluded) ready for Railway TICKERS env var.
+    This uses the same idea as before: fetch positions -> map to symbols -> filter crypto collisions.
+    """
+    if not ETORO_API_KEY or not ETORO_USER_KEY:
+        return "Missing ETORO_API_KEY / ETORO_USER_KEY in env."
+
+    headers = {
+        "accept": "application/json",
+        "user-agent": DEFAULT_UA,
+        "authorization": f"Bearer {ETORO_API_KEY}",
+        "x-etoro-user-key": ETORO_USER_KEY,
+    }
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.get(ETORO_POSITIONS_URL, headers=headers)
+        if r.status_code != 200:
+            return f"eToro positions fetch failed: {r.status_code}\n{r.text[:300]}"
+
+        data = r.json()
+
+    # ---- YOU MUST ADAPT THIS PART to your actual eToro JSON shape ----
+    # In your earlier logs you had "instrumentID" and later you mapped to "ticker".
+    # If your JSON already contains symbol/ticker, prefer that.
+    positions = data if isinstance(data, list) else data.get("positions") or data.get("data") or []
+
+    raw_symbols = []
+    for p in positions:
+        sym = p.get("ticker") or p.get("symbol")
+        if sym:
+            raw_symbols.append(normalize_ticker(sym))
+
+    # If you don't have symbol/ticker in positions, you need the instrumentID->ticker map like before.
+    # (That part depends on your existing mapping code / endpoint you already had.)
+
+    # crypto collisions exclude (e.g. W)
+    tickers = sorted({s for s in raw_symbols if s and s not in CRYPTO_EXCLUDE})
+
+    return ",".join(tickers)
 
 
 @app.get("/health", response_class=PlainTextResponse)
