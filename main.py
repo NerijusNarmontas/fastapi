@@ -1,14 +1,14 @@
 # main.py
-# FastAPI investing agent with:
-# - eToro portfolio dashboard (invested $, weight, P&L% with green/red)
-# - Technical line per holding (1M, RSI, 200DMA trend, Liquidity)
-# - Click ticker -> /t/{TICKER} shows cached News + SEC links
-#
-# FIX (your issue):
-# - Stooq often requires US tickers as TICKER.US (ex: EQT.US)
-# - Linking to TradingView does NOT provide data to your app.
-# - This code now auto-tries .US FIRST when the instrument exchange looks like NYSE/NASDAQ/AMEX/US,
-#   and also when the ticker is a typical US format (A-Z, 1-5 chars).
+# Robust single-file FastAPI investing agent (no more silent 500s):
+# - Portfolio from eToro (/tasks/daily)
+# - Invested $ column + Weight % + P&L % (green/red)
+# - Compact TECH line per ticker: 1M / 200DMA trend / RSI / Liquidity
+# - Energy Universe Scanner (/tasks/scan-energy) using free sources:
+#     Universe: StockAnalysis Energy sector list + URA holdings (uranium complex)
+#     Technicals: Stooq
+#     Fundamentals (US-first): SEC companyfacts (requires SEC_UA)
+# - Scanner results visible on / and /scanner
+# - Built-in debugging: /debug/last-error, /debug/env, /debug/state-keys
 #
 # Railway startCommand:
 #   hypercorn main:app --bind "0.0.0.0:$PORT"
@@ -20,6 +20,7 @@ import uuid
 import math
 import time
 import asyncio
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -27,20 +28,16 @@ from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
-
 
 app = FastAPI(title="My AI Investing Agent")
 
 # ----------------------------
 # Config
 # ----------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
 ETORO_API_KEY = os.getenv("ETORO_API_KEY", "").strip()
 ETORO_USER_KEY = os.getenv("ETORO_USER_KEY", "").strip()
-
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/investing_agent_state.json")
@@ -64,20 +61,18 @@ DEFAULT_UA = os.getenv(
 SEC_UA = os.getenv("SEC_UA", "").strip()
 
 NEWS_PER_TICKER = int(os.getenv("NEWS_PER_TICKER", "6"))
-SEC_PER_TICKER = int(os.getenv("SEC_PER_TICKER", "6"))
-
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "25"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "12"))
 
-# --- Energy scanner config ---
-ENERGY_UNIVERSE_MAX = int(os.getenv("ENERGY_UNIVERSE_MAX", "900"))
-ENERGY_SCAN_MAX = int(os.getenv("ENERGY_SCAN_MAX", "350"))
+# Energy scanner sizing (to avoid timeouts on free infra)
+ENERGY_UNIVERSE_MAX = int(os.getenv("ENERGY_UNIVERSE_MAX", "900"))  # stored universe size
+ENERGY_SCAN_MAX = int(os.getenv("ENERGY_SCAN_MAX", "250"))          # scanned per run (keep stable)
+
+# Universe sources
 ENERGY_SCAN_MODE = os.getenv("ENERGY_SCAN_MODE", "stockanalysis+ura").strip().lower()
+ENERGY_UNIVERSE_EXTRA = [x.strip().upper() for x in os.getenv("ENERGY_UNIVERSE_EXTRA", "").split(",") if x.strip()]
 
-ENERGY_UNIVERSE_EXTRA = [
-    x.strip().upper() for x in os.getenv("ENERGY_UNIVERSE_EXTRA", "").split(",") if x.strip()
-]
-
+# Exclude refiners by default (your thesis)
 REFINER_EXCLUDE = set(
     x.strip().upper() for x in os.getenv(
         "REFINER_EXCLUDE",
@@ -85,6 +80,7 @@ REFINER_EXCLUDE = set(
     ).split(",") if x.strip()
 )
 
+# Crypto handling (kept)
 CRYPTO_EXCLUDE = set(s.strip().upper() for s in os.getenv("CRYPTO_EXCLUDE", "W").split(",") if s.strip())
 CRYPTO_TICKERS = set(
     s.strip().upper()
@@ -100,9 +96,6 @@ CRYPTO_INSTRUMENT_IDS = set(
     if x.strip().isdigit()
 )
 
-# ----------------------------
-# Energy thesis (rules will be applied in scanner scoring)
-# ----------------------------
 ENERGY_THESIS = {
     "avoid": ["refining"],
     "preferred": ["gas", "oil", "midstream", "offshore (select)", "uranium", "nuclear fuel", "smrs"],
@@ -110,11 +103,42 @@ ENERGY_THESIS = {
 }
 
 # ----------------------------
-# State helpers
+# Error capture middleware (prevents blank 500)
+# ----------------------------
+_LAST_ERROR = {"when": None, "where": None, "trace": None}
+
+@app.middleware("http")
+async def catch_exceptions(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:
+        tb = traceback.format_exc()
+        _LAST_ERROR["when"] = utc_now_iso()
+        _LAST_ERROR["where"] = f"{request.method} {request.url.path}"
+        _LAST_ERROR["trace"] = tb
+
+        try:
+            st = load_state()
+            st["last_error"] = _LAST_ERROR
+            save_state(st)
+        except Exception:
+            pass
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "where": _LAST_ERROR["where"],
+                "when": _LAST_ERROR["when"],
+                "trace": tb[-9000:],
+            },
+        )
+
+# ----------------------------
+# Helpers
 # ----------------------------
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_PATH):
@@ -125,7 +149,6 @@ def load_state() -> Dict[str, Any]:
     except Exception:
         return {}
 
-
 def save_state(state: Dict[str, Any]) -> None:
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
@@ -133,12 +156,10 @@ def save_state(state: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-
 def normalize_ticker(t: str) -> str:
     t = (t or "").strip().upper()
     t = re.sub(r"[^A-Z0-9\.\-]", "", t)
     return t
-
 
 def html_escape(s: str) -> str:
     return (
@@ -149,7 +170,6 @@ def html_escape(s: str) -> str:
         .replace('"', "&quot;")
     )
 
-
 def normalize_number(x: Any) -> Optional[float]:
     if x is None:
         return None
@@ -157,7 +177,6 @@ def normalize_number(x: Any) -> Optional[float]:
         return float(x)
     except Exception:
         return None
-
 
 def fmt_money(x: Optional[float]) -> str:
     if x is None:
@@ -167,16 +186,34 @@ def fmt_money(x: Optional[float]) -> str:
     except Exception:
         return ""
 
-
 def safe_float(x: Any) -> float:
     try:
         return float(x)
     except Exception:
         return 0.0
 
+def tradingview_url(ticker: str, exchange: str = "") -> str:
+    t = normalize_ticker(ticker)
+    ex = (exchange or "").strip().upper()
+    if ex:
+        return f"https://www.tradingview.com/chart/?symbol={ex}:{t}"
+    return f"https://www.tradingview.com/symbols/{t}/"
+
+def edgar_search_link(ticker: str) -> str:
+    return f"https://www.sec.gov/edgar/search/#/q={quote_plus(ticker)}&sort=desc"
+
+def is_crypto_ticker(ticker: str, instrument_id: Optional[int] = None) -> bool:
+    t = normalize_ticker(ticker)
+    if t in CRYPTO_TICKERS:
+        return True
+    if instrument_id is not None and instrument_id in CRYPTO_INSTRUMENT_IDS:
+        return True
+    if t.endswith("-USD") and t[:-4] in CRYPTO_TICKERS:
+        return True
+    return False
 
 # ----------------------------
-# eToro portfolio plumbing
+# eToro HTTP
 # ----------------------------
 def etoro_headers() -> Dict[str, str]:
     if not ETORO_API_KEY or not ETORO_USER_KEY:
@@ -189,11 +226,9 @@ def etoro_headers() -> Dict[str, str]:
         "accept": "application/json",
     }
 
-
 async def etoro_get_real_pnl() -> Dict[str, Any]:
     if not ETORO_API_KEY or not ETORO_USER_KEY:
         raise HTTPException(status_code=400, detail="Missing ETORO_API_KEY or ETORO_USER_KEY")
-
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(ETORO_REAL_PNL_URL, headers=etoro_headers())
         if r.status_code >= 400:
@@ -204,6 +239,14 @@ async def etoro_get_real_pnl() -> Dict[str, Any]:
             raise HTTPException(status_code=r.status_code, detail=payload)
         return r.json()
 
+async def etoro_search(params: Dict[str, str]) -> Tuple[int, Any]:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        r = await client.get(ETORO_SEARCH_URL, headers=etoro_headers(), params=params)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"text": r.text}
+        return r.status_code, data
 
 def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
@@ -215,7 +258,6 @@ def extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         return payload["positions"]
     return []
 
-
 def pick_instrument_id(p: Dict[str, Any]) -> Optional[int]:
     iid = p.get("instrumentID") or p.get("instrumentId") or p.get("InstrumentId")
     try:
@@ -223,17 +265,14 @@ def pick_instrument_id(p: Dict[str, Any]) -> Optional[int]:
     except Exception:
         return None
 
-
 def pick_unrealized_pnl(p: Dict[str, Any]) -> Optional[float]:
     up = p.get("unrealizedPnL") or p.get("unrealizedPnl") or p.get("unrealized_pnl")
     if isinstance(up, dict):
         return normalize_number(up.get("pnL"))
     return normalize_number(up)
 
-
 def pick_initial_usd(p: Dict[str, Any]) -> Optional[float]:
     return normalize_number(p.get("initialAmountInDollars") or p.get("initialAmount") or p.get("initial_amount_usd"))
-
 
 def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     buckets = defaultdict(list)
@@ -258,24 +297,12 @@ def aggregate_positions_by_instrument(raw_positions: List[Dict[str, Any]]) -> Tu
     stats = {"lots_count": len(raw_positions), "unique_instruments_count": len(aggregated)}
     return aggregated, stats
 
-
-async def etoro_search(params: Dict[str, str]) -> Tuple[int, Any]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        r = await client.get(ETORO_SEARCH_URL, headers=etoro_headers(), params=params)
-        try:
-            data = r.json()
-        except Exception:
-            data = {"text": r.text}
-        return r.status_code, data
-
-
 def _extract_ticker_from_search_item(item: Dict[str, Any]) -> str:
     for k in ("internalSymbolFull", "symbolFull", "symbol"):
         v = item.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return ""
-
 
 def _extract_exchange_from_search_item(item: Dict[str, Any]) -> str:
     for k in ("exchange", "exchangeName", "exchangeCode", "marketName", "market"):
@@ -284,13 +311,11 @@ def _extract_exchange_from_search_item(item: Dict[str, Any]) -> str:
             return v.strip()
     return ""
 
-
 async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict[int, str], Dict[str, Any]]:
     ids = sorted(set(int(x) for x in instrument_ids if x is not None))
     out: Dict[int, str] = {}
     instrument_meta: Dict[str, Dict[str, str]] = {}
     debug: Dict[str, Any] = {"requested": len(ids), "mapped": 0, "failed": 0, "samples": []}
-
     sem = asyncio.Semaphore(10)
 
     async def one(iid: int):
@@ -335,18 +360,6 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict
     debug["instrument_meta"] = instrument_meta
     return out, debug
 
-
-def is_crypto_ticker(ticker: str, instrument_id: Optional[int] = None) -> bool:
-    t = normalize_ticker(ticker)
-    if t in CRYPTO_TICKERS:
-        return True
-    if instrument_id is not None and instrument_id in CRYPTO_INSTRUMENT_IDS:
-        return True
-    if t.endswith("-USD") and t[:-4] in CRYPTO_TICKERS:
-        return True
-    return False
-
-
 def build_portfolio_rows(agg: List[Dict[str, Any]], ticker_map: Dict[int, str]) -> List[Dict[str, Any]]:
     total_initial = sum(float(x.get("initialAmountInDollars") or 0) for x in agg) or 0.0
     rows: List[Dict[str, Any]] = []
@@ -378,94 +391,34 @@ def build_portfolio_rows(agg: List[Dict[str, Any]], ticker_map: Dict[int, str]) 
             "weight_pct": f"{weight_pct:.2f}" if weight_pct is not None else "",
             "pnl_pct": f"{pnl_pct:.2f}" if pnl_pct is not None else "",
         })
-
     return rows
 
-
 # ----------------------------
-# TECH METRICS (Stooq) — FIXED
+# TECH (Stooq)
 # ----------------------------
-_US_EXCHANGE_HINTS = (
-    "NYSE", "NASDAQ", "AMEX", "ARCA", "BATS", "CBOE", "US", "USA",
-    "NEW YORK", "N.Y.", "NMS", "NCM", "NQ"
-)
-
-def _looks_us_common_ticker(t: str) -> bool:
-    # Stooq’s pain point: US tickers often need .US; this catches EQT/AAPL/MSFT/etc.
-    # Avoid false positives for already-suffixed tickers and for crypto pairs.
-    if not t:
-        return False
-    if "." in t:
-        return False
-    if "-" in t:
-        # could be BRK-B type; still US, but keep conservative
-        return False
-    return bool(re.fullmatch(r"[A-Z]{1,5}", t))
-
-def _exchange_is_us(exchange: str) -> bool:
-    ex = (exchange or "").strip().upper()
-    if not ex:
-        return False
-    return any(h in ex for h in _US_EXCHANGE_HINTS)
-
-def _stooq_symbol_candidates(ticker: str, exchange: str = "") -> List[str]:
-    """
-    Order matters. For US, try TICKER.US first.
-    For already-suffixed, keep it.
-    """
+def _stooq_symbol_candidates(ticker: str) -> List[str]:
     t = normalize_ticker(ticker)
-    ex = (exchange or "").strip()
-
-    cands: List[str] = []
-
-    # If already provided in stooq-style
     if t.endswith(".US"):
         base = t[:-3]
-        cands.extend([t, base])
-    else:
-        # If we have an exchange hint that it is US-listed (NYSE/NASDAQ/etc), try .US first.
-        if _exchange_is_us(ex) and _looks_us_common_ticker(t):
-            cands.append(f"{t}.US")
+        return [f"{base}.US", base, t]
+    return [t, t.replace("-", "."), t.replace(".", "-")]
 
-        # Also if it just looks like a normal US ticker, try .US first anyway (helps EQT).
-        if _looks_us_common_ticker(t):
-            cands.append(f"{t}.US")
-
-        # Then fall back to raw / normalized variants
-        cands.extend([t, t.replace("-", "."), t.replace(".", "-")])
-
-    # de-dupe preserving order
-    out = []
-    seen = set()
-    for s in cands:
-        ss = normalize_ticker(s)
-        if not ss or ss in seen:
-            continue
-        seen.add(ss)
-        out.append(ss)
-    return out
-
-
-async def fetch_stooq_daily(client: httpx.AsyncClient, ticker: str, exchange: str = "") -> List[Dict[str, float]]:
-    for sym in _stooq_symbol_candidates(ticker, exchange):
+async def fetch_stooq_daily(client: httpx.AsyncClient, ticker: str) -> List[Dict[str, float]]:
+    for sym in _stooq_symbol_candidates(ticker):
         url = f"https://stooq.com/q/d/l/?s={sym.lower()}&i=d"
         r = await client.get(url, headers={"user-agent": DEFAULT_UA})
         if r.status_code != 200 or "Date,Open,High,Low,Close,Volume" not in r.text:
             continue
-
         lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
         if len(lines) < 30:
             continue
-
         out = []
         for ln in lines[1:]:
             parts = ln.split(",")
             if len(parts) < 6:
                 continue
             try:
-                h = float(parts[2])
-                l = float(parts[3])
-                c = float(parts[4])
+                h = float(parts[2]); l = float(parts[3]); c = float(parts[4])
                 v = float(parts[5]) if parts[5] not in ("", "nan", "NaN") else 0.0
             except Exception:
                 continue
@@ -474,26 +427,21 @@ async def fetch_stooq_daily(client: httpx.AsyncClient, ticker: str, exchange: st
             return out
     return []
 
-
 def sma(values: List[float], n: int) -> Optional[float]:
     if len(values) < n:
         return None
     return sum(values[-n:]) / n
 
-
 def rsi14(closes: List[float], n: int = 14) -> Optional[float]:
     if len(closes) < n + 1:
         return None
-    gains = []
-    losses = []
+    gains, losses = [], []
     for i in range(-n, 0):
         ch = closes[i] - closes[i - 1]
         if ch >= 0:
-            gains.append(ch)
-            losses.append(0.0)
+            gains.append(ch); losses.append(0.0)
         else:
-            gains.append(0.0)
-            losses.append(-ch)
+            gains.append(0.0); losses.append(-ch)
     avg_gain = sum(gains) / n
     avg_loss = sum(losses) / n
     if avg_loss == 0:
@@ -501,16 +449,13 @@ def rsi14(closes: List[float], n: int = 14) -> Optional[float]:
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
-
 def monthly_return_pct(closes: List[float], lookback_days: int = 21) -> Optional[float]:
     if len(closes) < lookback_days + 1:
         return None
-    a = closes[-lookback_days - 1]
-    b = closes[-1]
+    a = closes[-lookback_days - 1]; b = closes[-1]
     if a == 0:
         return None
     return (b / a - 1.0) * 100.0
-
 
 def liquidity_flag(bars: List[Dict[str, float]], days: int = 20) -> Tuple[str, Optional[float]]:
     if len(bars) < days:
@@ -522,25 +467,17 @@ def liquidity_flag(bars: List[Dict[str, float]], days: int = 20) -> Tuple[str, O
         return ("NA", None)
     return ("OK" if avg_dv >= 2_000_000 else "LOW", avg_dv)
 
-
 def build_compact_line(ticker: str, bars: List[Dict[str, float]]) -> Dict[str, Any]:
     closes = [x["close"] for x in bars]
     last = closes[-1] if closes else None
-
     mret = monthly_return_pct(closes)
     sma200 = sma(closes, 200)
     trend = None
     if last is not None and sma200 is not None:
         trend = "above" if last >= sma200 else "below"
-
     rsi = rsi14(closes, 14)
     liq, avg_dv = liquidity_flag(bars, 20)
-
-    warn = False
-    if rsi is not None and rsi <= 30:
-        warn = True
-    if liq == "LOW":
-        warn = True
+    warn = bool((rsi is not None and rsi <= 30) or (liq == "LOW"))
 
     parts = []
     if mret is not None:
@@ -564,33 +501,25 @@ def build_compact_line(ticker: str, bars: List[Dict[str, float]]) -> Dict[str, A
         "warn": warn,
     }
 
-
-async def compute_tech_cache(tickers: List[str], exchange_map: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """
-    exchange_map: {TICKER: exchange_string} so we can decide .US first for NYSE/NASDAQ.
-    """
+async def compute_tech_cache(tickers: List[str]) -> Dict[str, Any]:
     sem = asyncio.Semaphore(CONCURRENCY)
     tech_cache: Dict[str, Any] = {}
-    exchange_map = exchange_map or {}
-
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-
         async def do_one(t: str):
             async with sem:
-                ex = exchange_map.get(t, "")
-                bars = await fetch_stooq_daily(client, t, ex)
-                if bars:
-                    tech_cache[t] = build_compact_line(t, bars)
-                else:
-                    tech_cache[t] = {"ticker": t, "compact": "Tech NA", "warn": False, "liq": "NA", "note": "symbol not available on Stooq"}
-
+                try:
+                    bars = await fetch_stooq_daily(client, t)
+                    if bars:
+                        tech_cache[t] = build_compact_line(t, bars)
+                    else:
+                        tech_cache[t] = {"ticker": t, "compact": "Tech NA", "warn": False, "liq": "NA"}
+                except Exception:
+                    tech_cache[t] = {"ticker": t, "compact": "Tech ERR", "warn": True, "liq": "NA"}
         await asyncio.gather(*(do_one(t) for t in tickers))
-
     return tech_cache
 
-
 # ----------------------------
-# News (Google News RSS)
+# News (Google RSS) - portfolio only
 # ----------------------------
 def parse_rss_items(xml_text: str) -> List[Dict[str, Any]]:
     try:
@@ -610,29 +539,20 @@ def parse_rss_items(xml_text: str) -> List[Dict[str, Any]]:
         })
     return out
 
-
 def resume_news(title: str) -> str:
     t = (title or "").lower()
     tags = []
-    if any(k in t for k in ["earnings", "guidance", "revenue", "eps"]):
-        tags.append("Earnings / guidance")
-    if any(k in t for k in ["acquire", "acquisition", "merger", "buyout", "takeover"]):
-        tags.append("M&A")
-    if any(k in t for k in ["offering", "private placement", "convertible", "debt", "notes", "atm", "shelf"]):
-        tags.append("Financing")
-    if any(k in t for k in ["lawsuit", "probe", "investigation", "fraud", "settlement"]):
-        tags.append("Legal")
-    if any(k in t for k in ["upgrade", "downgrade", "price target", "analyst"]):
-        tags.append("Analyst")
-    if any(k in t for k in ["8-k", "10-q", "10-k", "s-1", "f-1", "edgar"]):
-        tags.append("Filing")
-    return " • ".join(tags) if tags else "Headline update"
-
+    if any(k in t for k in ["earnings", "guidance", "revenue", "eps"]): tags.append("Earnings")
+    if any(k in t for k in ["acquire", "acquisition", "merger", "buyout"]): tags.append("M&A")
+    if any(k in t for k in ["offering", "convertible", "debt", "notes", "atm"]): tags.append("Financing")
+    if any(k in t for k in ["lawsuit", "probe", "investigation"]): tags.append("Legal")
+    if any(k in t for k in ["upgrade", "downgrade", "price target"]): tags.append("Analyst")
+    return " • ".join(tags) if tags else "Headline"
 
 async def fetch_google_news_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[Dict[str, Any]]:
     q = quote_plus(f"{ticker} stock")
     url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
-    r = await client.get(url, headers={"accept": "application/rss+xml, text/xml;q=0.9,*/*;q=0.8", "user-agent": DEFAULT_UA})
+    r = await client.get(url, headers={"accept": "application/rss+xml,*/*", "user-agent": DEFAULT_UA})
     if r.status_code != 200:
         return []
     items = parse_rss_items(r.text)
@@ -656,24 +576,119 @@ async def fetch_google_news_for_ticker(client: httpx.AsyncClient, ticker: str) -
             break
     return out
 
-
 async def compute_news(tickers: List[str]) -> Dict[str, Any]:
     sem = asyncio.Semaphore(CONCURRENCY)
     cache: Dict[str, Any] = {}
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
         async def do_one(t: str):
             async with sem:
-                cache[t] = await fetch_google_news_for_ticker(client, t)
+                try:
+                    cache[t] = await fetch_google_news_for_ticker(client, t)
+                except Exception:
+                    cache[t] = []
         await asyncio.gather(*(do_one(t) for t in tickers))
     return cache
 
+# ----------------------------
+# Energy Universe (free)
+# ----------------------------
+STOCKANALYSIS_ENERGY_URL = "https://stockanalysis.com/stocks/sector/energy/"
+GLOBALX_URA_CSV = "https://www.globalxetfs.com/funds/ura/?download=holdings"
 
-def edgar_search_link(ticker: str) -> str:
-    return f"https://www.sec.gov/edgar/search/#/q={quote_plus(ticker)}&sort=desc"
+def parse_stockanalysis_energy_tickers(html: str, limit: int) -> List[str]:
+    # Best-effort: pull /stocks/{symbol}/ links
+    syms = re.findall(r'href="/stocks/([a-z0-9\.\-]+)/"', html, flags=re.I)
+    out, seen = [], set()
+    for s in syms:
+        t = normalize_ticker(s)
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= limit:
+            break
+    return out
 
+def parse_csv_tickers(csv_text: str) -> List[str]:
+    lines = [ln.strip() for ln in csv_text.splitlines() if ln.strip()]
+    if not lines:
+        return []
+    header = [h.strip().lower() for h in lines[0].split(",")]
+    if "ticker" not in header:
+        return []
+    idx = header.index("ticker")
+    out, seen = [], set()
+    for ln in lines[1:]:
+        parts = [p.strip().strip('"') for p in ln.split(",")]
+        if idx >= len(parts):
+            continue
+        t = normalize_ticker(parts[idx])
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+async def build_energy_universe(state: Dict[str, Any]) -> Dict[str, Any]:
+    now = time.time()
+    cache = state.get("energy_universe_cache") or {}
+    meta = cache.get("meta") or {}
+    ts = float(meta.get("ts") or 0.0)
+    if cache.get("tickers") and (now - ts) < (7 * 24 * 3600):
+        return cache
+
+    tickers: List[str] = []
+    sources: List[str] = []
+    warnings: List[str] = []
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+        if "stockanalysis" in ENERGY_SCAN_MODE:
+            try:
+                r = await client.get(STOCKANALYSIS_ENERGY_URL, headers={"user-agent": DEFAULT_UA})
+                if r.status_code == 200:
+                    tickers.extend(parse_stockanalysis_energy_tickers(r.text, ENERGY_UNIVERSE_MAX))
+                    sources.append("stockanalysis_energy")
+                else:
+                    warnings.append(f"stockanalysis status {r.status_code}")
+            except Exception as e:
+                warnings.append(f"stockanalysis error: {repr(e)}")
+
+        if "ura" in ENERGY_SCAN_MODE:
+            try:
+                r = await client.get(GLOBALX_URA_CSV, headers={"user-agent": DEFAULT_UA, "accept": "text/csv,*/*"})
+                if r.status_code == 200:
+                    tickers.extend(parse_csv_tickers(r.text))
+                    sources.append("ura_holdings")
+                else:
+                    warnings.append(f"ura status {r.status_code}")
+            except Exception as e:
+                warnings.append(f"ura error: {repr(e)}")
+
+    tickers.extend(ENERGY_UNIVERSE_EXTRA)
+
+    # normalize + dedupe + exclude refiners
+    out, seen = [], set()
+    for t in tickers:
+        tt = normalize_ticker(t)
+        if not tt or tt in seen:
+            continue
+        seen.add(tt)
+        if tt in REFINER_EXCLUDE:
+            continue
+        out.append(tt)
+
+    cache = {
+        "tickers": out,
+        "sources": sources,
+        "warnings": warnings,
+        "meta": {"ts": now, "date": utc_now_iso(), "count": len(out)},
+    }
+    state["energy_universe_cache"] = cache
+    save_state(state)
+    return cache
 
 # ----------------------------
-# SEC fundamentals (free, US-first)
+# SEC Fundamentals (US-first, free)
 # ----------------------------
 SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
@@ -692,7 +707,6 @@ SHARES_CONCEPTS = [
     "EntityCommonStockSharesOutstanding",
 ]
 
-
 async def get_sec_ticker_map(state: Dict[str, Any]) -> Dict[str, str]:
     now = time.time()
     cache = state.get("sec_ticker_map") or {}
@@ -702,7 +716,7 @@ async def get_sec_ticker_map(state: Dict[str, Any]) -> Dict[str, str]:
         return cache
 
     if not SEC_UA:
-        return cache  # no UA => don't fetch
+        return cache
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
         r = await client.get(SEC_TICKER_MAP_URL, headers={"user-agent": SEC_UA, "accept": "application/json"})
@@ -726,13 +740,11 @@ async def get_sec_ticker_map(state: Dict[str, Any]) -> Dict[str, str]:
     save_state(state)
     return out
 
-
 def _pick_latest_quarters(facts: Dict[str, Any], concept_names: List[str]) -> List[float]:
     try:
         usgaap = facts.get("facts", {}).get("us-gaap", {})
     except Exception:
         return []
-
     series = None
     for c in concept_names:
         if c in usgaap:
@@ -740,12 +752,10 @@ def _pick_latest_quarters(facts: Dict[str, Any], concept_names: List[str]) -> Li
             break
     if not series:
         return []
-
     units = series.get("units") or {}
     candidates = units.get("USD") or units.get("usd") or []
     if not isinstance(candidates, list):
         return []
-
     vals = []
     for x in candidates:
         if not isinstance(x, dict):
@@ -763,10 +773,8 @@ def _pick_latest_quarters(facts: Dict[str, Any], concept_names: List[str]) -> Li
             vals.append((x.get("end") or "", float(v)))
         except Exception:
             continue
-
     vals.sort(key=lambda z: z[0], reverse=True)
     return [v for _, v in vals[:8]]
-
 
 def _pick_latest_shares(facts: Dict[str, Any]) -> List[float]:
     try:
@@ -801,7 +809,6 @@ def _pick_latest_shares(facts: Dict[str, Any]) -> List[float]:
     vals.sort(key=lambda z: z[0], reverse=True)
     return [v for _, v in vals[:8]]
 
-
 async def fetch_sec_companyfacts(client: httpx.AsyncClient, cik10: str) -> Optional[Dict[str, Any]]:
     if not SEC_UA:
         return None
@@ -814,7 +821,6 @@ async def fetch_sec_companyfacts(client: httpx.AsyncClient, cik10: str) -> Optio
     except Exception:
         return None
 
-
 def compute_fundamentals_from_facts(facts: Dict[str, Any], last_price: Optional[float]) -> Dict[str, Any]:
     cfo_q = _pick_latest_quarters(facts, CFO_CONCEPTS)
     capex_q = _pick_latest_quarters(facts, CAPEX_CONCEPTS)
@@ -822,10 +828,7 @@ def compute_fundamentals_from_facts(facts: Dict[str, Any], last_price: Optional[
 
     ttm_cfo = sum(cfo_q[:4]) if len(cfo_q) >= 4 else None
     ttm_capex = sum(capex_q[:4]) if len(capex_q) >= 4 else None
-
-    fcf = None
-    if ttm_cfo is not None and ttm_capex is not None:
-        fcf = ttm_cfo - ttm_capex
+    fcf = (ttm_cfo - ttm_capex) if (ttm_cfo is not None and ttm_capex is not None) else None
 
     sh_latest = shares[0] if shares else None
     sh_old = shares[4] if len(shares) >= 5 else (shares[-1] if len(shares) >= 2 else None)
@@ -850,8 +853,11 @@ def compute_fundamentals_from_facts(facts: Dict[str, Any], last_price: Optional[
         "dilution_yoy_pct": dilution_yoy,
         "mktcap_est": mktcap,
         "fcf_yield_pct": fcf_yield,
+        "compact": fundamentals_compact({
+            "fcf_yield_pct": fcf_yield,
+            "dilution_yoy_pct": dilution_yoy,
+        })
     }
-
 
 def fundamentals_compact(f: Dict[str, Any]) -> str:
     fy = f.get("fcf_yield_pct")
@@ -867,119 +873,13 @@ def fundamentals_compact(f: Dict[str, Any]) -> str:
         parts.append("Shares NA")
     return " | ".join(parts)
 
-
 # ----------------------------
-# Energy universe builders (free)
-# ----------------------------
-STOCKANALYSIS_ENERGY_URL = "https://stockanalysis.com/stocks/sector/energy/"
-GLOBALX_URA_CSV = "https://www.globalxetfs.com/funds/ura/?download=holdings"
-
-def parse_stockanalysis_energy_tickers(html: str, limit: int) -> List[str]:
-    syms = re.findall(r'href="/stocks/([a-z0-9\.\-]+)/"', html, flags=re.I)
-    out = []
-    seen = set()
-    for s in syms:
-        t = normalize_ticker(s)
-        if not t or t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-        if len(out) >= limit:
-            break
-    return out
-
-
-async def fetch_energy_universe_stockanalysis(client: httpx.AsyncClient, limit: int) -> List[str]:
-    r = await client.get(STOCKANALYSIS_ENERGY_URL, headers={"user-agent": DEFAULT_UA})
-    if r.status_code != 200:
-        return []
-    return parse_stockanalysis_energy_tickers(r.text, limit)
-
-
-def parse_csv_tickers(csv_text: str) -> List[str]:
-    lines = [ln.strip() for ln in csv_text.splitlines() if ln.strip()]
-    if not lines:
-        return []
-    header = [h.strip().lower() for h in lines[0].split(",")]
-    if "ticker" not in header:
-        return []
-    idx = header.index("ticker")
-    out = []
-    seen = set()
-    for ln in lines[1:]:
-        parts = [p.strip().strip('"') for p in ln.split(",")]
-        if idx >= len(parts):
-            continue
-        t = normalize_ticker(parts[idx])
-        if not t or t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-    return out
-
-
-async def fetch_ura_holdings_tickers(client: httpx.AsyncClient) -> List[str]:
-    r = await client.get(GLOBALX_URA_CSV, headers={"user-agent": DEFAULT_UA, "accept": "text/csv,*/*"})
-    if r.status_code != 200:
-        return []
-    return parse_csv_tickers(r.text)
-
-
-async def build_energy_universe(state: Dict[str, Any]) -> Dict[str, Any]:
-    now = time.time()
-    cache = state.get("energy_universe_cache") or {}
-    meta = cache.get("meta") or {}
-    ts = float(meta.get("ts") or 0.0)
-    if cache.get("tickers") and (now - ts) < (7 * 24 * 3600):
-        return cache
-
-    tickers: List[str] = []
-    sources: List[str] = []
-
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-        if "stockanalysis" in ENERGY_SCAN_MODE:
-            sa = await fetch_energy_universe_stockanalysis(client, ENERGY_UNIVERSE_MAX)
-            if sa:
-                tickers.extend(sa)
-                sources.append("stockanalysis_energy")
-
-        if "ura" in ENERGY_SCAN_MODE:
-            ura = await fetch_ura_holdings_tickers(client)
-            if ura:
-                tickers.extend(ura)
-                sources.append("ura_holdings")
-
-    tickers.extend(ENERGY_UNIVERSE_EXTRA)
-
-    out = []
-    seen = set()
-    for t in tickers:
-        tt = normalize_ticker(t)
-        if not tt or tt in seen:
-            continue
-        seen.add(tt)
-        if tt in REFINER_EXCLUDE:
-            continue
-        out.append(tt)
-
-    cache = {
-        "tickers": out,
-        "sources": sources,
-        "meta": {"ts": now, "date": utc_now_iso(), "count": len(out)},
-    }
-    state["energy_universe_cache"] = cache
-    save_state(state)
-    return cache
-
-
-# ----------------------------
-# Energy scanner scoring
+# Scanner scoring
 # ----------------------------
 def score_candidate(ticker: str, tech: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
     liq = tech.get("liq") or "NA"
     trend = tech.get("trend_vs_200")
     rsi = tech.get("rsi14")
-
     fy = fund.get("fcf_yield_pct")
     dil = fund.get("dilution_yoy_pct")
 
@@ -987,63 +887,37 @@ def score_candidate(ticker: str, tech: Dict[str, Any], fund: Dict[str, Any]) -> 
     tags = []
 
     if liq == "OK":
-        score += 10
-        tags.append("Liq OK")
+        score += 10; tags.append("Liq OK")
     elif liq == "LOW":
-        score -= 25
-        tags.append("Liq LOW")
+        score -= 25; tags.append("Liq LOW")
     else:
-        score -= 10
-        tags.append("Liq NA")
+        score -= 10; tags.append("Liq NA")
 
     if fy is None or not math.isfinite(fy):
-        score -= 5
-        tags.append("FCF NA")
+        score -= 5; tags.append("FCF NA")
     else:
-        if fy >= 12:
-            score += 20
-            tags.append("FCF strong")
-        elif fy >= 8:
-            score += 14
-            tags.append("FCF good")
-        elif fy >= 4:
-            score += 6
-            tags.append("FCF ok")
-        elif fy >= 0:
-            score -= 6
-            tags.append("FCF weak")
-        else:
-            score -= 15
-            tags.append("FCF negative")
+        if fy >= 12: score += 20; tags.append("FCF strong")
+        elif fy >= 8: score += 14; tags.append("FCF good")
+        elif fy >= 4: score += 6; tags.append("FCF ok")
+        elif fy >= 0: score -= 6; tags.append("FCF weak")
+        else: score -= 15; tags.append("FCF negative")
 
     if dil is None or not math.isfinite(dil):
         tags.append("Shares NA")
     else:
-        if dil <= -2:
-            score += 8
-            tags.append("Buyback")
-        elif dil <= 2:
-            score += 2
-            tags.append("No dilution")
+        if dil <= -2: score += 8; tags.append("Buyback")
+        elif dil <= 2: score += 2; tags.append("No dilution")
         else:
-            score -= min(15, dil)
-            tags.append("Dilution risk")
+            score -= min(15, dil); tags.append("Dilution risk")
 
     if trend == "above":
-        score += 6
-        tags.append("Above 200DMA")
+        score += 6; tags.append("Above 200DMA")
     elif trend == "below":
-        score -= 6
-        tags.append("Below 200DMA")
+        score -= 6; tags.append("Below 200DMA")
 
-    entry_flag = ""
     if rsi is not None and math.isfinite(rsi):
-        if rsi <= 30:
-            entry_flag = "Oversold"
-            tags.append("RSI<30")
-        elif rsi >= 70:
-            entry_flag = "Overbought"
-            tags.append("RSI>70")
+        if rsi <= 30: tags.append("RSI<30")
+        elif rsi >= 70: tags.append("RSI>70")
 
     bucket = "Satellite"
     if (liq == "OK") and (fy is not None and math.isfinite(fy) and fy >= 8) and (dil is None or dil <= 2):
@@ -1052,31 +926,33 @@ def score_candidate(ticker: str, tech: Dict[str, Any], fund: Dict[str, Any]) -> 
         bucket = "Avoid"
 
     score = max(0.0, min(100.0, score))
-
     return {
         "ticker": ticker,
         "score": round(score, 1),
         "bucket": bucket,
-        "entry_flag": entry_flag,
+        "tags": tags[:6],
         "tech": tech,
         "fund": fund,
-        "tags": tags[:6],
     }
-
 
 async def run_energy_scan(state: Dict[str, Any]) -> Dict[str, Any]:
     uni = await build_energy_universe(state)
-    universe = (uni.get("tickers") or [])[: max(10, ENERGY_SCAN_MAX)]
+    universe = (uni.get("tickers") or [])[:max(10, ENERGY_SCAN_MAX)]
 
     tech_cache = await compute_tech_cache(universe)
 
-    sec_map = await get_sec_ticker_map(state)
+    sec_map: Dict[str, str] = {}
+    sec_warning = None
+    try:
+        sec_map = await get_sec_ticker_map(state)
+    except Exception as e:
+        sec_warning = f"SEC map error: {repr(e)}"
+        sec_map = {}
 
-    sem = asyncio.Semaphore(CONCURRENCY)
     fund_cache: Dict[str, Any] = {}
+    sem = asyncio.Semaphore(CONCURRENCY)
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-
         async def do_one(t: str):
             async with sem:
                 tech = tech_cache.get(t) or {}
@@ -1089,17 +965,22 @@ async def run_energy_scan(state: Dict[str, Any]) -> Dict[str, Any]:
                 if not facts:
                     fund_cache[t] = {"note": "Fund NA (SEC fetch fail)"}
                     return
-                f = compute_fundamentals_from_facts(facts, last_price)
-                f["compact"] = fundamentals_compact(f)
-                fund_cache[t] = f
+                fund_cache[t] = compute_fundamentals_from_facts(facts, last_price)
 
-        await asyncio.gather(*(do_one(t) for t in universe))
+        # If SEC_UA missing, skip SEC calls completely
+        if SEC_UA and sec_map:
+            await asyncio.gather(*(do_one(t) for t in universe))
+        else:
+            for t in universe:
+                fund_cache[t] = {"note": "Fund NA (SEC_UA missing)" if not SEC_UA else "Fund NA"}
 
     rows = []
     for t in universe:
-        tech = tech_cache.get(t) or {"compact": "Tech NA", "liq": "NA"}
-        fund = fund_cache.get(t) or {"note": "Fund NA"}
-        rows.append(score_candidate(t, tech, fund))
+        rows.append(score_candidate(
+            t,
+            tech_cache.get(t) or {"compact": "Tech NA", "liq": "NA"},
+            fund_cache.get(t) or {"note": "Fund NA"},
+        ))
 
     bucket_rank = {"Core": 0, "Satellite": 1, "Avoid": 2}
     rows.sort(key=lambda r: (bucket_rank.get(r.get("bucket"), 9), -float(r.get("score") or 0.0), r.get("ticker") or ""))
@@ -1109,6 +990,7 @@ async def run_energy_scan(state: Dict[str, Any]) -> Dict[str, Any]:
         "universe_count": len(uni.get("tickers") or []),
         "scanned": len(universe),
         "sources": uni.get("sources") or [],
+        "warnings": (uni.get("warnings") or []) + ([sec_warning] if sec_warning else []),
         "top": rows[:200],
         "all_count": len(rows),
     }
@@ -1117,9 +999,8 @@ async def run_energy_scan(state: Dict[str, Any]) -> Dict[str, Any]:
     save_state(state)
     return result
 
-
 # ----------------------------
-# UI helpers
+# Sorting helpers (portfolio)
 # ----------------------------
 SORT_KEYS = {
     "ticker": lambda r: (r.get("ticker") or ""),
@@ -1128,21 +1009,10 @@ SORT_KEYS = {
     "pnl": lambda r: (-1e18 if r.get("pnl_pct_is_na") else float(r.get("pnl_pct_num") or 0.0)),
     "lots": lambda r: int(r.get("lots") or 0),
 }
-
-
 def sort_rows(rows: List[Dict[str, Any]], sort_by: str, direction: str) -> List[Dict[str, Any]]:
     key_fn = SORT_KEYS.get(sort_by, SORT_KEYS["weight"])
     rev = (direction or "desc").lower() != "asc"
     return sorted(rows, key=key_fn, reverse=rev)
-
-
-def tradingview_url(ticker: str, exchange: str = "") -> str:
-    t = normalize_ticker(ticker)
-    ex = (exchange or "").strip().upper()
-    if ex:
-        return f"https://www.tradingview.com/chart/?symbol={ex}:{t}"
-    return f"https://www.tradingview.com/symbols/{t}/"
-
 
 # ----------------------------
 # Routes
@@ -1151,18 +1021,39 @@ def tradingview_url(ticker: str, exchange: str = "") -> str:
 def health() -> str:
     return "ok"
 
+@app.get("/debug/last-error")
+async def debug_last_error():
+    st = load_state()
+    return JSONResponse(st.get("last_error") or _LAST_ERROR or {"note": "no error captured yet"})
+
+@app.get("/debug/env")
+async def debug_env():
+    return JSONResponse({
+        "has_ETORO_API_KEY": bool(ETORO_API_KEY),
+        "has_ETORO_USER_KEY": bool(ETORO_USER_KEY),
+        "has_SEC_UA": bool(SEC_UA),
+        "HTTP_TIMEOUT": HTTP_TIMEOUT,
+        "CONCURRENCY": CONCURRENCY,
+        "ENERGY_UNIVERSE_MAX": ENERGY_UNIVERSE_MAX,
+        "ENERGY_SCAN_MAX": ENERGY_SCAN_MAX,
+        "ENERGY_SCAN_MODE": ENERGY_SCAN_MODE,
+    })
+
+@app.get("/debug/state-keys")
+async def debug_state_keys():
+    st = load_state()
+    return JSONResponse({"keys": sorted(list(st.keys()))})
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(sort: str = "weight", dir: str = "desc"):
     state = load_state()
-
-    last_update = state.get("date") or utc_now_iso()
+    last_update = state.get("date") or "never"
     stats = state.get("stats") or {}
     mapping = state.get("mapping") or {}
+    positions = state.get("positions") or []
     instrument_meta = state.get("instrument_meta") or {}
     tech_cache = state.get("tech_cache") or {}
-
-    positions = state.get("positions") or []
+    scan = state.get("energy_scan") or {}
 
     sort_by = (sort or "weight").lower()
     direction = (dir or "desc").lower()
@@ -1187,10 +1078,9 @@ async def dashboard(sort: str = "weight", dir: str = "desc"):
             return "neg"
         return "flat"
 
-    def render_table(rows: List[Dict[str, Any]]) -> str:
+    def render_portfolio(rows: List[Dict[str, Any]]) -> str:
         if not rows:
-            return "<div class='muted'>No positions.</div>"
-
+            return "<div class='muted'>No positions (run <code>/tasks/daily</code>).</div>"
         rows_sorted = sort_rows(rows, sort_by, direction)
         out = []
         out.append("<table><thead><tr>"
@@ -1200,7 +1090,6 @@ async def dashboard(sort: str = "weight", dir: str = "desc"):
                    f"<th>{hdr('Weight %','weight')}</th>"
                    f"<th>{hdr('P&L %','pnl')}</th>"
                    "</tr></thead><tbody>")
-
         for r in rows_sorted[:400]:
             t = r.get("ticker", "")
             iid = (r.get("instrumentID") or "0")
@@ -1213,22 +1102,8 @@ async def dashboard(sort: str = "weight", dir: str = "desc"):
             tech = tech_cache.get(t, {})
             compact = tech.get("compact") or ""
             warn = bool(tech.get("warn"))
-            mret = tech.get("mret_1m_pct", None)
-
-            compact_html = ""
-            if compact:
-                icon = "⚠️ " if warn else ""
-                if mret is not None:
-                    mret_class = "pos" if mret > 0 else ("neg" if mret < 0 else "flat")
-                    first = compact.split("|")[0].strip()
-                    rest = " | ".join([p.strip() for p in compact.split("|")[1:]]) if "|" in compact else ""
-                    colored_first = f"<span class='{mret_class}'>{html_escape(first)}</span>"
-                    compact_html = f"<div class='muted techline'>{icon}{colored_first}"
-                    if rest:
-                        compact_html += f" <span class='muted'>| {html_escape(rest)}</span>"
-                    compact_html += "</div>"
-                else:
-                    compact_html = f"<div class='muted techline'>{icon}{html_escape(compact)}</div>"
+            icon = "⚠️ " if warn else ""
+            techline = f"<div class='muted techline'>{icon}{html_escape(compact)}</div>" if compact else ""
 
             out.append(
                 "<tr>"
@@ -1238,7 +1113,7 @@ async def dashboard(sort: str = "weight", dir: str = "desc"):
                 f"<a href='{html_escape(tv)}' target='_blank' rel='noopener noreferrer' "
                 f"title='Open in TradingView' style='font-size:11px; text-decoration:none;'>tv</a>"
                 f"</sup>"
-                f"{compact_html}"
+                f"{techline}"
                 "</td>"
                 f"<td>{html_escape(str(r.get('lots','')))}</td>"
                 f"<td>{html_escape(r.get('invested_disp',''))}</td>"
@@ -1249,26 +1124,25 @@ async def dashboard(sort: str = "weight", dir: str = "desc"):
         out.append("</tbody></table>")
         return "".join(out)
 
-    scan = state.get("energy_scan") or {}
-    scan_date = scan.get("date")
-    scan_top = scan.get("top") or []
-    scan_html = "<div class='muted'>No scan yet. Run <code>/tasks/scan-energy</code>.</div>"
-    if scan_top:
+    def render_scan_top(scan_obj: Dict[str, Any]) -> str:
+        top = scan_obj.get("top") or []
+        if not top:
+            return "<div class='muted'>No scan yet. Run <code>/tasks/scan-energy</code>.</div>"
         out = []
         out.append("<table><thead><tr>"
                    "<th>Ticker</th><th>Bucket</th><th>Score</th><th>Fundamentals</th><th>Tech</th>"
                    "</tr></thead><tbody>")
-        for rr in scan_top[:25]:
-            tt = rr.get("ticker")
-            bucket = rr.get("bucket")
-            score = rr.get("score")
-            fund = rr.get("fund") or {}
-            tech = rr.get("tech") or {}
+        for r in top[:25]:
+            t = r.get("ticker")
+            bucket = r.get("bucket")
+            score = r.get("score")
+            fund = r.get("fund") or {}
+            tech = r.get("tech") or {}
             fline = fund.get("compact") or fund.get("note") or "Fund NA"
             tline = tech.get("compact") or "Tech NA"
             out.append(
                 "<tr>"
-                f"<td><a href='/t/{html_escape(tt)}' target='_blank' rel='noopener noreferrer'>{html_escape(tt)}</a></td>"
+                f"<td><a href='/t/{html_escape(t)}' target='_blank' rel='noopener noreferrer'>{html_escape(t)}</a></td>"
                 f"<td>{html_escape(bucket)}</td>"
                 f"<td>{html_escape(str(score))}</td>"
                 f"<td class='muted' style='font-size:12px;'>{html_escape(fline)}</td>"
@@ -1276,7 +1150,14 @@ async def dashboard(sort: str = "weight", dir: str = "desc"):
                 "</tr>"
             )
         out.append("</tbody></table>")
-        scan_html = "".join(out)
+        return "".join(out)
+
+    scan_date = scan.get("date") or "never"
+    scan_sources = ", ".join(scan.get("sources") or [])
+    scan_warn = scan.get("warnings") or []
+    warn_html = ""
+    if scan_warn:
+        warn_html = "<div class='muted' style='margin-top:6px; font-size:12px;'>" + html_escape(" | ".join(scan_warn[:3])) + "</div>"
 
     html = f"""
     <html>
@@ -1320,36 +1201,38 @@ async def dashboard(sort: str = "weight", dir: str = "desc"):
       <body>
         <div class="wrap">
           <h1>My AI Investing Agent</h1>
+
           <div class="topline">
-            <div><b>Last portfolio update:</b> {html_escape(last_update)}</div>
-            <div><b>Lots:</b> {stats.get("lots_count","")} · <b>Unique instruments:</b> {stats.get("unique_instruments_count","")}</div>
-            <div><b>Mapping:</b> {mapping.get("mapped","")}/{mapping.get("requested","")}</div>
+            <div><b>Last portfolio update:</b> {html_escape(str(last_update))}</div>
+            <div><b>Lots:</b> {html_escape(str(stats.get("lots_count","")))} · <b>Unique:</b> {html_escape(str(stats.get("unique_instruments_count","")))}</div>
+            <div><b>Mapping:</b> {html_escape(str(mapping.get("mapped","")))} / {html_escape(str(mapping.get("requested","")))}</div>
             <div>Refresh portfolio: <code>/tasks/daily</code></div>
-            <div>Scan energy universe: <code>/tasks/scan-energy</code></div>
+            <div>Scan energy: <code>/tasks/scan-energy</code></div>
             <div><a href="/scanner" target="_self">Open Scanner</a></div>
+            <div class="muted"><a href="/debug/env" target="_self">env</a> · <a href="/debug/last-error" target="_self">last-error</a></div>
           </div>
 
           <div class="section">
             <div style="font-weight:800; font-size:16px;">Energy Scanner (Top 25)</div>
             <div class="muted" style="margin-top:4px;">
-              Last scan: {html_escape(scan_date or "never")} · Universe sources: {html_escape(", ".join(scan.get("sources") or []))}
+              Last scan: {html_escape(scan_date)} · Sources: {html_escape(scan_sources)}
             </div>
-            <div style="margin-top:10px;">{scan_html}</div>
+            {warn_html}
+            <div style="margin-top:10px;">{render_scan_top(scan)}</div>
           </div>
 
           <div class="section">
             <div style="font-weight:800; font-size:16px;">Portfolio</div>
             <div class="muted" style="margin-top:4px;">Sort with headers · green=positive, red=negative.</div>
-            <div style="margin-top:10px;">{render_table(positions)}</div>
+            <div style="margin-top:10px;">{render_portfolio(positions)}</div>
           </div>
 
-          <p class="muted">Click ticker for links page (News + SEC). Click <b>tv</b> for TradingView.</p>
+          <p class="muted">Click ticker for links. Click <b>tv</b> for TradingView.</p>
         </div>
       </body>
     </html>
     """
     return HTMLResponse(html)
-
 
 @app.get("/scanner", response_class=HTMLResponse)
 async def scanner():
@@ -1360,6 +1243,7 @@ async def scanner():
     sources = ", ".join(scan.get("sources") or [])
     uni_count = scan.get("universe_count") or 0
     scanned = scan.get("scanned") or 0
+    warnings = scan.get("warnings") or []
 
     if not rows:
         body = "<div class='muted'>No scan yet. Run <code>/tasks/scan-energy</code>.</div>"
@@ -1389,6 +1273,10 @@ async def scanner():
             )
         out.append("</tbody></table>")
         body = "".join(out)
+
+    warn_html = ""
+    if warnings:
+        warn_html = "<div class='muted' style='margin-top:8px; font-size:12px;'>" + html_escape(" | ".join(warnings[:5])) + "</div>"
 
     html = f"""
     <html>
@@ -1420,29 +1308,28 @@ async def scanner():
         <div class="top">
           <h1 style="margin:0;">Energy Scanner</h1>
           <a class="btn" href="/" target="_self">Back</a>
-          <span class="muted">Last scan: {html_escape(date)} · Sources: {html_escape(sources)} · Universe: {uni_count} · Scanned now: {scanned}</span>
+          <span class="muted">Last scan: {html_escape(date)} · Sources: {html_escape(sources)} · Universe: {uni_count} · Scanned: {scanned}</span>
           <span class="muted">Run: <code>/tasks/scan-energy</code></span>
         </div>
+        {warn_html}
         {body}
       </body>
     </html>
     """
     return HTMLResponse(html)
 
-
 @app.get("/t/{ticker}", response_class=HTMLResponse)
 async def ticker_page(ticker: str):
     state = load_state()
     t = normalize_ticker(ticker)
-
     news_cache = state.get("news_cache") or {}
     news_items = (news_cache.get(t) or [])[:NEWS_PER_TICKER]
     tv = tradingview_url(t, "")
 
     def render_news():
         if not news_items:
-            return "<div class='muted'>No news cached for this ticker. Run <code>/tasks/daily</code> (portfolio tickers only) or add it to portfolio.</div>"
-        out = ["<ul class='lst'>"]
+            return "<div class='muted'>No cached news for this ticker (news is cached for portfolio tickers only).</div>"
+        out = ["<ul>"]
         for it in news_items:
             out.append(
                 "<li>"
@@ -1474,8 +1361,6 @@ async def ticker_page(ticker: str):
             border-radius:10px; background:#f5f5f5; color:#111; font-size:13px;
           }}
           .card {{ border:1px solid #ddd; border-radius:12px; padding:12px; margin:12px 0; }}
-          ul.lst {{ margin: 8px 0 0 18px; padding:0; }}
-          ul.lst li {{ margin: 10px 0; line-height:1.25; }}
         </style>
       </head>
       <body>
@@ -1483,11 +1368,10 @@ async def ticker_page(ticker: str):
           <h1 style="margin:0;">{html_escape(t)}</h1>
           <div style="margin-top:10px;">
             <a class="btn" href="/" target="_self">Back</a>
-            <a class="btn" href="{html_escape(tv)}" target="_blank" rel="noopener noreferrer">Open TradingView</a>
-            <a class="btn" href="{html_escape(edgar_search_link(t))}" target="_blank" rel="noopener noreferrer">Open EDGAR</a>
+            <a class="btn" href="{html_escape(tv)}" target="_blank" rel="noopener noreferrer">TradingView</a>
+            <a class="btn" href="{html_escape(edgar_search_link(t))}" target="_blank" rel="noopener noreferrer">EDGAR</a>
           </div>
         </div>
-
         <div class="card">
           <div style="font-weight:800; font-size:13px; text-transform:uppercase; letter-spacing:.08em;">News</div>
           {render_news()}
@@ -1497,57 +1381,45 @@ async def ticker_page(ticker: str):
     """
     return HTMLResponse(html)
 
-
 @app.get("/tasks/daily")
-async def run_daily():
+async def task_daily():
     state = load_state()
+    state["date"] = utc_now_iso()
 
-    try:
-        payload = await etoro_get_real_pnl()
-        raw_positions = extract_positions(payload)
-        agg_positions, stats = aggregate_positions_by_instrument(raw_positions)
-    except HTTPException as e:
-        state.update({
-            "date": utc_now_iso(),
-            "positions": [],
-            "stats": {"lots_count": 0, "unique_instruments_count": 0},
-            "mapping": {},
-            "instrument_meta": {},
-        })
-        save_state(state)
-        return {"status": "error", "detail": e.detail}
+    # eToro pull
+    payload = await etoro_get_real_pnl()
+    raw_positions = extract_positions(payload)
+    agg_positions, stats = aggregate_positions_by_instrument(raw_positions)
 
     instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
     ticker_map, map_debug = await map_instrument_ids_to_tickers(instrument_ids)
 
     portfolio_rows = build_portfolio_rows(agg_positions, ticker_map)
-
-    # Build exchange_map for tech fetch (THIS is what fixes EQT on Stooq)
-    instrument_meta = map_debug.get("instrument_meta") or {}
-    exchange_map: Dict[str, str] = {}
-    for r in portfolio_rows:
-        iid = str(r.get("instrumentID") or "")
-        t = r.get("ticker") or ""
-        ex = (instrument_meta.get(iid) or {}).get("exchange", "")
-        if t and ex:
-            exchange_map[t] = ex
-
     tickers = sorted({r["ticker"] for r in portfolio_rows if r.get("ticker")})
-    tech_cache = await compute_tech_cache(tickers, exchange_map=exchange_map)
 
-    news_cache = await compute_news(tickers)
+    # Tech cache (never crash the whole task)
+    try:
+        tech_cache = await compute_tech_cache(tickers)
+    except Exception as e:
+        tech_cache = {}
+        state["daily_warning_tech"] = repr(e)
+
+    # News cache (never crash the whole task)
+    try:
+        news_cache = await compute_news(tickers)
+    except Exception as e:
+        news_cache = {}
+        state["daily_warning_news"] = repr(e)
 
     state.update({
-        "date": utc_now_iso(),
         "positions": portfolio_rows,
         "stats": stats,
         "mapping": {"requested": map_debug.get("requested"), "mapped": map_debug.get("mapped")},
         "mapping_last_debug": map_debug,
-        "instrument_meta": instrument_meta,
+        "instrument_meta": map_debug.get("instrument_meta") or {},
         "tech_cache": tech_cache,
         "news_cache": news_cache,
         "energy_thesis": ENERGY_THESIS,
-        "exchange_map": exchange_map,
     })
     save_state(state)
 
@@ -1557,10 +1429,7 @@ async def run_daily():
         "unique_instruments": stats["unique_instruments_count"],
         "mapped_symbols": map_debug.get("mapped"),
         "portfolio_tickers": len(tickers),
-        "news_total": sum(len(v) for v in news_cache.values()),
-        "note": "Stooq tech now tries TICKER.US first for US exchanges (fixes EQT).",
     }
-
 
 @app.get("/tasks/scan-energy")
 async def task_scan_energy():
@@ -1572,41 +1441,26 @@ async def task_scan_energy():
         "universe_count": res.get("universe_count"),
         "scanned": res.get("scanned"),
         "sources": res.get("sources"),
+        "warnings": res.get("warnings"),
         "top_count": len(res.get("top") or []),
-        "note": "US SEC filers get real fundamentals; others may show Fund NA.",
+        "note": "Best fundamentals for US SEC filers; set SEC_UA for full SEC access.",
     }
-
 
 @app.get("/api/scanner")
 async def api_scanner():
     state = load_state()
     return JSONResponse(state.get("energy_scan") or {"note": "Run /tasks/scan-energy"})
 
-
-@app.get("/debug/mapping-last")
-async def debug_mapping_last():
+@app.get("/api/portfolio")
+async def api_portfolio():
     state = load_state()
-    return JSONResponse(state.get("mapping_last_debug") or {"note": "Run /tasks/daily first."})
-
-
-@app.get("/debug/tech/{ticker}")
-async def debug_tech_ticker(ticker: str):
-    """
-    Quick sanity check: shows which Stooq symbols were tried for this ticker and whether it worked.
-    """
-    t = normalize_ticker(ticker)
-    state = load_state()
-    ex = (state.get("exchange_map") or {}).get(t, "")
-    tried = _stooq_symbol_candidates(t, ex)
-
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-        bars = await fetch_stooq_daily(client, t, ex)
-
-    return {
-        "ticker": t,
-        "exchange_hint": ex,
-        "stooq_candidates_tried": tried,
-        "bars_len": len(bars),
-        "ok": bool(bars),
-        "tip": "If ok=false for a US stock, Stooq might be down or rate-limiting; add a Yahoo fallback later.",
-    }
+    return JSONResponse({
+        "date": state.get("date") or utc_now_iso(),
+        "stats": state.get("stats") or {},
+        "positions": state.get("positions") or [],
+        "mapping": state.get("mapping") or {},
+        "warnings": {
+            "daily_warning_tech": state.get("daily_warning_tech"),
+            "daily_warning_news": state.get("daily_warning_news"),
+        }
+    })
