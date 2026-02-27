@@ -4,11 +4,16 @@
 # - Aggregates by instrumentID
 # - Maps instrumentID -> ticker via eToro /market-data/search
 # - Separates Crypto vs Stocks (crypto list includes your tickers)
-# - Categorizes stocks into industry-like groups (your manual mappings included)
+# - Categorizes stocks into industry-like groups (manual mappings included)
 # - CLEAN dashboard (white background / black text)
+# - Adds TECH line next to each ticker:
+#     "1M -12% ⚠️ | Trend below 200DMA | RSI 28 | Liq OK"
+# - Negative values shown in RED, positive in GREEN
+# - Adds "Invested $" column (so you know how much you invested per ticker)
+# - Sorting: click table headers (or use ?sort=...&dir=...)
 # - News/SEC links shown ONLY when you click a ticker:
-#     /t/{TICKER} opens a new page with cached News + SEC links
-# - Adds a tiny superscript "tv" link next to each ticker to open TradingView live
+#     /t/{TICKER} opens a page with cached News + SEC links
+# - Adds tiny superscript "tv" link next to each ticker to open TradingView live
 # - Fetches FREE news (Google News RSS) + SEC links (cached by /tasks/daily)
 #
 # Railway startCommand:
@@ -36,6 +41,7 @@ import os
 import re
 import json
 import uuid
+import math
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,6 +53,7 @@ import xml.etree.ElementTree as ET
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+
 
 app = FastAPI(title="My AI Investing Agent")
 
@@ -113,7 +120,6 @@ CONCURRENCY = int(os.getenv("CONCURRENCY", "10"))
 # ----------------------------
 # Industry-like categories (manual overrides first)
 # ----------------------------
-# Your explicit mapping + core portfolio examples
 CATEGORY_OVERRIDES: Dict[str, Tuple[str, str]] = {
     # Your explicit mapping
     "CEG": ("Energy", "Power / Nuclear-linked"),
@@ -134,7 +140,7 @@ CATEGORY_OVERRIDES: Dict[str, Tuple[str, str]] = {
     "ARQQ": ("Quantum", "Quantum / Security"),
     "RGTI": ("Quantum", "Quantum Computing"),
 
-    # Energy / gas / midstream examples (keep grouping clean)
+    # Energy / gas / midstream examples
     "EQT": ("Gas", "Gas E&P"),
     "CTRA": ("Gas", "Gas E&P"),
     "RRC": ("Gas", "Gas E&P"),
@@ -358,22 +364,170 @@ def group_rows(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], L
             groups[industry]["tickers"].append(t)
 
     for industry in groups:
-        groups[industry]["rows"].sort(key=lambda x: float(x.get("weight_pct") or 0), reverse=True)
+        groups[industry]["rows"].sort(key=lambda x: float(x.get("weight_pct_num") or 0), reverse=True)
         groups[industry]["tickers"] = list(dict.fromkeys(groups[industry]["tickers"]))
 
-    crypto_rows.sort(key=lambda x: float(x.get("weight_pct") or 0), reverse=True)
+    crypto_rows.sort(key=lambda x: float(x.get("weight_pct_num") or 0), reverse=True)
     return groups, crypto_rows
 
 
 def tradingview_url(ticker: str, exchange: str = "") -> str:
-    """
-    Prefer chart URL when exchange is known, otherwise fallback to symbol page.
-    """
     t = normalize_ticker(ticker)
     ex = (exchange or "").strip().upper()
     if ex:
         return f"https://www.tradingview.com/chart/?symbol={ex}:{t}"
     return f"https://www.tradingview.com/symbols/{t}/"
+
+
+def fmt_money(x: Optional[float]) -> str:
+    if x is None:
+        return ""
+    try:
+        return f"{x:,.0f}"
+    except Exception:
+        return ""
+
+
+def safe_float(x: Any) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+# ----------------------------
+# TECH METRICS (Stooq)
+# ----------------------------
+def _stooq_symbol_candidates(ticker: str) -> List[str]:
+    t = normalize_ticker(ticker)
+    if t.endswith(".US"):
+        base = t[:-3]
+        return [f"{base}.US", base, t]
+    return [t, t.replace("-", "."), t.replace(".", "-")]
+
+
+async def fetch_stooq_daily(client: httpx.AsyncClient, ticker: str) -> List[Dict[str, float]]:
+    """
+    Returns list of bars oldest->newest with keys: close, high, low, volume
+    """
+    for sym in _stooq_symbol_candidates(ticker):
+        url = f"https://stooq.com/q/d/l/?s={sym.lower()}&i=d"
+        r = await client.get(url, headers={"user-agent": DEFAULT_UA})
+        if r.status_code != 200 or "Date,Open,High,Low,Close,Volume" not in r.text:
+            continue
+
+        lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
+        if len(lines) < 30:
+            continue
+
+        out = []
+        for ln in lines[1:]:
+            parts = ln.split(",")
+            if len(parts) < 6:
+                continue
+            try:
+                h = float(parts[2])
+                l = float(parts[3])
+                c = float(parts[4])
+                v = float(parts[5]) if parts[5] not in ("", "nan", "NaN") else 0.0
+            except Exception:
+                continue
+            out.append({"high": h, "low": l, "close": c, "volume": v})
+        if len(out) >= 30:
+            return out
+    return []
+
+
+def sma(values: List[float], n: int) -> Optional[float]:
+    if len(values) < n:
+        return None
+    return sum(values[-n:]) / n
+
+
+def rsi14(closes: List[float], n: int = 14) -> Optional[float]:
+    if len(closes) < n + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(-n, 0):
+        ch = closes[i] - closes[i - 1]
+        if ch >= 0:
+            gains.append(ch)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(-ch)
+    avg_gain = sum(gains) / n
+    avg_loss = sum(losses) / n
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def monthly_return_pct(closes: List[float], lookback_days: int = 21) -> Optional[float]:
+    if len(closes) < lookback_days + 1:
+        return None
+    a = closes[-lookback_days - 1]
+    b = closes[-1]
+    if a == 0:
+        return None
+    return (b / a - 1.0) * 100.0
+
+
+def liquidity_flag(bars: List[Dict[str, float]], days: int = 20) -> Tuple[str, Optional[float]]:
+    """
+    Returns ("OK"/"LOW"/"NA", avg_dollar_vol)
+    """
+    if len(bars) < days:
+        return ("NA", None)
+    recent = bars[-days:]
+    dvs = [(x["close"] * (x.get("volume") or 0.0)) for x in recent]
+    avg_dv = (sum(dvs) / days) if dvs else None
+    if avg_dv is None:
+        return ("NA", None)
+    return ("OK" if avg_dv >= 2_000_000 else "LOW", avg_dv)
+
+
+def build_compact_line(ticker: str, bars: List[Dict[str, float]]) -> Dict[str, Any]:
+    closes = [x["close"] for x in bars]
+    last = closes[-1] if closes else None
+
+    mret = monthly_return_pct(closes)
+    sma200 = sma(closes, 200)
+    trend = None
+    if last is not None and sma200 is not None:
+        trend = "above" if last >= sma200 else "below"
+
+    rsi = rsi14(closes, 14)
+    liq, avg_dv = liquidity_flag(bars, 20)
+
+    warn = False
+    if rsi is not None and rsi <= 30:
+        warn = True
+    if liq == "LOW":
+        warn = True
+
+    parts = []
+    if mret is not None:
+        parts.append(f"1M {mret:+.0f}%")
+    if trend:
+        parts.append(f"Trend {trend} 200DMA")
+    if rsi is not None:
+        parts.append(f"RSI {rsi:.0f}")
+    parts.append(f"Liq {liq}")
+
+    return {
+        "ticker": ticker,
+        "mret_1m_pct": mret,
+        "sma200": sma200,
+        "trend_vs_200": trend,
+        "rsi14": rsi,
+        "liq": liq,
+        "avg_dollar_vol": avg_dv,
+        "compact": " | ".join(parts),
+        "warn": warn,
+    }
 
 
 # ----------------------------
@@ -425,7 +579,6 @@ def _extract_ticker_from_search_item(item: Dict[str, Any]) -> str:
 
 
 def _extract_exchange_from_search_item(item: Dict[str, Any]) -> str:
-    # Field names vary; try common possibilities.
     for k in ("exchange", "exchangeName", "exchangeCode", "marketName", "market"):
         v = item.get(k)
         if isinstance(v, str) and v.strip():
@@ -440,14 +593,13 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict
     """
     ids = sorted(set(int(x) for x in instrument_ids if x is not None))
     out: Dict[int, str] = {}
-    instrument_meta: Dict[int, Dict[str, str]] = {}
+    instrument_meta: Dict[str, Dict[str, str]] = {}
     debug: Dict[str, Any] = {"requested": len(ids), "mapped": 0, "failed": 0, "samples": []}
 
     sem = asyncio.Semaphore(10)
 
     async def one(iid: int):
         async with sem:
-            # Try instrumentId filter
             status, data = await etoro_search({"instrumentId": str(iid), "pageSize": "5", "pageNumber": "1"})
             items = data.get("items") if isinstance(data, dict) else None
             if isinstance(items, list) and items:
@@ -458,13 +610,12 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict
                     if t:
                         out[iid] = t
                         ex = _extract_exchange_from_search_item(it)
-                        instrument_meta[iid] = {"exchange": ex}
+                        instrument_meta[str(iid)] = {"exchange": ex}
                         debug["mapped"] += 1
                         if len(debug["samples"]) < 10:
                             debug["samples"].append({"instrumentID": iid, "ticker": t, "exchange": ex, "via": "instrumentId", "status": status})
                         return
 
-            # Fallback: internalInstrumentId filter
             status2, data2 = await etoro_search({"internalInstrumentId": str(iid), "pageSize": "5", "pageNumber": "1"})
             items2 = data2.get("items") if isinstance(data2, dict) else None
             if isinstance(items2, list) and items2:
@@ -475,7 +626,7 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict
                     if t:
                         out[iid] = t
                         ex = _extract_exchange_from_search_item(it)
-                        instrument_meta[iid] = {"exchange": ex}
+                        instrument_meta[str(iid)] = {"exchange": ex}
                         debug["mapped"] += 1
                         if len(debug["samples"]) < 10:
                             debug["samples"].append({"instrumentID": iid, "ticker": t, "exchange": ex, "via": "internalInstrumentId", "status": status2})
@@ -491,7 +642,7 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict
 
 
 # ----------------------------
-# Portfolio rows + PnL%
+# Portfolio rows + PnL% + Invested$
 # ----------------------------
 def build_portfolio_rows(agg: List[Dict[str, Any]], ticker_map: Dict[int, str]) -> List[Dict[str, Any]]:
     total_initial = sum(float(x.get("initialAmountInDollars") or 0) for x in agg) or 0.0
@@ -514,12 +665,20 @@ def build_portfolio_rows(agg: List[Dict[str, Any]], ticker_map: Dict[int, str]) 
 
         rows.append({
             "ticker": ticker,
-            "lots": str(a.get("lots", "")),
+            "lots": int(a.get("lots", 0) or 0),
+            "instrumentID": str(iid),
+
+            # numeric fields for sorting
+            "invested_usd": float(initial or 0.0),
+            "unreal_usd": float(unreal or 0.0),
+            "weight_pct_num": float(weight_pct or 0.0),
+            "pnl_pct_num": float(pnl_pct or 0.0) if pnl_pct is not None else 0.0,
+            "pnl_pct_is_na": pnl_pct is None,
+
+            # display fields
+            "invested_disp": fmt_money(float(initial or 0.0)),
             "weight_pct": f"{weight_pct:.2f}" if weight_pct is not None else "",
             "pnl_pct": f"{pnl_pct:.2f}" if pnl_pct is not None else "",
-            "instrumentID": str(iid),
-            "initial_usd": float(initial or 0),
-            "unreal_usd": float(unreal or 0),
         })
 
     return rows
@@ -710,7 +869,7 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
         return "AI brief disabled (no key)."
 
     top = portfolio_rows[:20]
-    lines = [f"{r['ticker']}: w={r.get('weight_pct','')}% pnl={r.get('pnl_pct','')}%" for r in top]
+    lines = [f"{r['ticker']}: invested=${r.get('invested_disp','')} w={r.get('weight_pct','')}% pnl={r.get('pnl_pct','')}%" for r in top]
     portfolio_text = "\n".join(lines) if lines else "(no positions)"
 
     prompt = (
@@ -730,13 +889,14 @@ async def generate_openai_brief(portfolio_rows: List[Dict[str, Any]]) -> str:
                 err = r.json()
             except Exception:
                 err = {"text": r.text}
+            # show clean message (your screenshot showed 429 insufficient_quota)
             return f"OpenAI error {r.status_code}: {err}"
         data = r.json()
         return data.get("output_text") or "AI brief generated (output_text missing)."
 
 
 # ----------------------------
-# Daily Task: tickers -> news + sec
+# Daily Task: tickers -> tech + news + sec
 # ----------------------------
 async def compute_news_and_sec(tickers: List[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     sem = asyncio.Semaphore(CONCURRENCY)
@@ -759,6 +919,42 @@ async def compute_news_and_sec(tickers: List[str]) -> Tuple[Dict[str, Any], Dict
     return news_cache, sec_cache
 
 
+async def compute_tech_cache(tickers: List[str]) -> Dict[str, Any]:
+    sem = asyncio.Semaphore(CONCURRENCY)
+    tech_cache: Dict[str, Any] = {}
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+
+        async def do_one(t: str):
+            async with sem:
+                bars = await fetch_stooq_daily(client, t)
+                if bars:
+                    tech_cache[t] = build_compact_line(t, bars)
+                else:
+                    tech_cache[t] = {"ticker": t, "compact": "Tech NA (no data)", "warn": False}
+
+        await asyncio.gather(*(do_one(t) for t in tickers))
+
+    return tech_cache
+
+
+# ----------------------------
+# Sorting helpers
+# ----------------------------
+SORT_KEYS = {
+    "ticker": lambda r: (r.get("ticker") or ""),
+    "invested": lambda r: float(r.get("invested_usd") or 0.0),
+    "weight": lambda r: float(r.get("weight_pct_num") or 0.0),
+    "pnl": lambda r: (-1e18 if r.get("pnl_pct_is_na") else float(r.get("pnl_pct_num") or 0.0)),
+    "lots": lambda r: int(r.get("lots") or 0),
+}
+
+def sort_rows(rows: List[Dict[str, Any]], sort_by: str, direction: str) -> List[Dict[str, Any]]:
+    key_fn = SORT_KEYS.get(sort_by, SORT_KEYS["weight"])
+    rev = (direction or "desc").lower() != "asc"
+    return sorted(rows, key=key_fn, reverse=rev)
+
+
 # ----------------------------
 # Routes
 # ----------------------------
@@ -768,7 +964,7 @@ def health() -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard():
+async def dashboard(sort: str = "weight", dir: str = "desc"):
     state = load_state()
 
     last_update = state.get("date") or utc_now_iso()
@@ -783,48 +979,125 @@ async def dashboard():
     mapped = mapping.get("mapped", "")
     requested = mapping.get("requested", "")
 
-    groups = state.get("groups") or {}          # {industry: {"rows":[], "tickers":[]}}
+    groups = state.get("groups") or {}
     crypto_rows = state.get("crypto_rows") or []
-    instrument_meta = state.get("instrument_meta") or {}  # {instrumentID: {"exchange": "..."}}
+    instrument_meta = state.get("instrument_meta") or {}  # {instrumentID(str): {"exchange": "..."}}
+    tech_cache = state.get("tech_cache") or {}
+
+    sort_by = (sort or "weight").lower()
+    direction = (dir or "desc").lower()
+    if sort_by not in SORT_KEYS:
+        sort_by = "weight"
+    if direction not in ("asc", "desc"):
+        direction = "desc"
 
     def bullets(items: List[str]) -> str:
         lis = "".join([f"<li>{html_escape(x)}</li>" for x in items]) if items else "<li>None</li>"
         return f"<ul>{lis}</ul>"
 
-    def render_table(rows: List[Dict[str, Any]]) -> str:
+    def hdr(label: str, key: str) -> str:
+        next_dir = "asc" if (sort_by == key and direction == "desc") else "desc"
+        arrow = ""
+        if sort_by == key:
+            arrow = " ▲" if direction == "asc" else " ▼"
+        return f"<a href='/?sort={html_escape(key)}&dir={html_escape(next_dir)}'>{html_escape(label)}{arrow}</a>"
+
+    def render_table(rows: List[Dict[str, Any]], is_crypto: bool = False) -> str:
         if not rows:
             return "<div class='muted'>No positions.</div>"
+
+        rows_sorted = sort_rows(rows, sort_by, direction)
+
         out = []
         out.append("<table><thead><tr>"
-                   "<th>Ticker</th><th>Lots</th><th>Weight %</th><th>P&amp;L %</th>"
+                   f"<th>{hdr('Ticker','ticker')}</th>"
+                   f"<th>{hdr('Lots','lots')}</th>"
+                   f"<th>{hdr('Invested $','invested')}</th>"
+                   f"<th>{hdr('Weight %','weight')}</th>"
+                   f"<th>{hdr('P&L %','pnl')}</th>"
                    "</tr></thead><tbody>")
-        for r in rows[:200]:
-            t = r.get("ticker", "")
-            iid = 0
-            try:
-                iid = int(r.get("instrumentID") or 0)
-            except Exception:
-                iid = 0
 
-            ex = (instrument_meta.get(str(iid)) or instrument_meta.get(iid) or {}).get("exchange", "")
+        for r in rows_sorted[:300]:
+            t = r.get("ticker", "")
+            iid = (r.get("instrumentID") or "0")
+            ex = (instrument_meta.get(str(iid)) or {}).get("exchange", "")
             tv = tradingview_url(t, ex)
+
+            pnl_num = None if r.get("pnl_pct_is_na") else safe_float(r.get("pnl_pct_num"))
+            pnl_class = "na"
+            if pnl_num is not None:
+                pnl_class = "pos" if pnl_num > 0 else ("neg" if pnl_num < 0 else "flat")
+
+            tech = tech_cache.get(t, {})
+            compact = tech.get("compact") or ""
+            warn = bool(tech.get("warn"))
+            mret = tech.get("mret_1m_pct", None)
+
+            # Style 1M return red/green inside the compact line (only for that part)
+            compact_html = ""
+            if compact:
+                icon = "⚠️ " if warn else ""
+                if mret is not None:
+                    mret_class = "pos" if mret > 0 else ("neg" if mret < 0 else "flat")
+                    # Replace first "1M ..." part by colored span
+                    # Best-effort: find prefix until first "|"
+                    first = compact.split("|")[0].strip()
+                    rest = " | ".join([p.strip() for p in compact.split("|")[1:]]) if "|" in compact else ""
+                    colored_first = f"<span class='{mret_class}'>{html_escape(first)}</span>"
+                    compact_html = f"<div class='muted techline'>{icon}{colored_first}"
+                    if rest:
+                        compact_html += f" <span class='muted'>| {html_escape(rest)}</span>"
+                    compact_html += "</div>"
+                else:
+                    compact_html = f"<div class='muted techline'>{icon}{html_escape(compact)}</div>"
+
+            ticker_link = f"<a href='/t/{html_escape(t)}' target='_blank' rel='noopener noreferrer'>{html_escape(t)}</a>"
+            if is_crypto:
+                # crypto page still works for tv + cached links page (news/sec may be empty)
+                pass
 
             out.append(
                 "<tr>"
                 "<td>"
-                f"<a href='/t/{html_escape(t)}' target='_blank' rel='noopener noreferrer'>{html_escape(t)}</a>"
+                f"{ticker_link}"
                 f"<sup style='margin-left:6px;'>"
                 f"<a href='{html_escape(tv)}' target='_blank' rel='noopener noreferrer' "
                 f"title='Open in TradingView' style='font-size:11px; text-decoration:none;'>tv</a>"
                 f"</sup>"
+                f"{compact_html}"
                 "</td>"
-                f"<td>{html_escape(r.get('lots',''))}</td>"
+                f"<td>{html_escape(str(r.get('lots','')))}</td>"
+                f"<td>{html_escape(r.get('invested_disp',''))}</td>"
                 f"<td>{html_escape(r.get('weight_pct',''))}</td>"
-                f"<td>{html_escape(r.get('pnl_pct',''))}</td>"
+                f"<td class='{pnl_class}'>{html_escape(r.get('pnl_pct',''))}</td>"
                 "</tr>"
             )
         out.append("</tbody></table>")
         return "".join(out)
+
+    # Build "All Stocks" list (ticker + invested) for quick overview
+    all_stock_rows: List[Dict[str, Any]] = []
+    for industry in groups:
+        all_stock_rows.extend((groups.get(industry) or {}).get("rows") or [])
+    all_stock_rows = sort_rows(all_stock_rows, "invested", "desc")
+
+    all_stocks_html = ""
+    if all_stock_rows:
+        out = []
+        out.append("<table><thead><tr>"
+                   "<th>Ticker</th><th>Invested $</th><th>Weight %</th>"
+                   "</tr></thead><tbody>")
+        for r in all_stock_rows[:400]:
+            t = r.get("ticker", "")
+            out.append(
+                "<tr>"
+                f"<td>{html_escape(t)}</td>"
+                f"<td>{html_escape(r.get('invested_disp',''))}</td>"
+                f"<td>{html_escape(r.get('weight_pct',''))}</td>"
+                "</tr>"
+            )
+        out.append("</tbody></table>")
+        all_stocks_html = "".join(out)
 
     category_html = ""
     for industry in ordered_industries(groups):
@@ -832,7 +1105,7 @@ async def dashboard():
         category_html += f"""
         <details class="section" open>
           <summary>{html_escape(industry)} <span class="muted">({len(rows)} positions)</span></summary>
-          <div class="block">{render_table(rows)}</div>
+          <div class="block">{render_table(rows, is_crypto=False)}</div>
         </details>
         """
 
@@ -841,8 +1114,8 @@ async def dashboard():
         crypto_html = f"""
         <details class="section">
           <summary>Crypto <span class="muted">({len(crypto_rows)} positions)</span></summary>
-          <div class="block">{render_table(crypto_rows)}</div>
-          <div class="muted">Crypto news/SEC not fetched by default. Click ticker for its links page, and “tv” for TradingView.</div>
+          <div class="block">{render_table(crypto_rows, is_crypto=True)}</div>
+          <div class="muted">Crypto news/SEC not fetched by default. Click ticker for links page, and “tv” for TradingView.</div>
         </details>
         """
 
@@ -861,14 +1134,16 @@ async def dashboard():
           a {{ color: #0b57d0; text-decoration:none; }}
           a:hover {{ text-decoration:underline; }}
           .muted {{ color:#555; }}
-          .wrap {{ max-width: 1100px; }}
+          .wrap {{ max-width: 1200px; }}
 
           .topline {{ display:flex; gap:18px; flex-wrap:wrap; align-items:baseline; }}
           code {{ background:#f3f3f3; border:1px solid #ddd; padding:2px 6px; border-radius:8px; }}
 
           table {{ border-collapse: collapse; width: 100%; margin-top: 8px; }}
-          th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 14px; }}
+          th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 14px; vertical-align: top; }}
           th {{ background: #f5f5f5; text-align: left; }}
+          th a {{ color:#111; }}
+          th a:hover {{ text-decoration:underline; }}
 
           .section {{
             border: 1px solid #ddd;
@@ -891,6 +1166,21 @@ async def dashboard():
             padding:12px;
             border-radius:12px;
           }}
+
+          .pos {{ color: #0a7a2f; font-weight: 700; }}
+          .neg {{ color: #b00020; font-weight: 700; }}
+          .flat {{ color: #111; font-weight: 700; }}
+          .na {{ color: #555; }}
+
+          .techline {{ font-size:12px; margin-top:3px; }}
+          .grid {{
+            display:grid;
+            grid-template-columns: 1.3fr 1fr;
+            gap: 14px;
+          }}
+          @media (max-width: 980px) {{
+            .grid {{ grid-template-columns: 1fr; }}
+          }}
         </style>
       </head>
       <body>
@@ -901,6 +1191,7 @@ async def dashboard():
             <div><b>Lots:</b> {stats.get("lots_count","")} · <b>Unique instruments:</b> {stats.get("unique_instruments_count","")}</div>
             <div><b>Mapping:</b> {mapped}/{requested}</div>
             <div>Refresh: <code>/tasks/daily</code></div>
+            <div class="muted">Sort: <code>?sort=ticker|invested|weight|pnl|lots&dir=asc|desc</code></div>
           </div>
 
           <h2>Material Events</h2>
@@ -915,10 +1206,20 @@ async def dashboard():
           <h2>AI Brief</h2>
           <pre>{html_escape(ai_brief or "No brief yet. Run /tasks/daily.")}</pre>
 
-          {crypto_html}
-
-          <h2>Stocks (industry groups)</h2>
-          {category_html if category_html else "<div class='muted'>No categorized stock positions yet. Run /tasks/daily.</div>"}
+          <div class="grid">
+            <div>
+              {crypto_html}
+              <h2>Stocks (industry groups)</h2>
+              {category_html if category_html else "<div class='muted'>No categorized stock positions yet. Run /tasks/daily.</div>"}
+            </div>
+            <div>
+              <div class="section" open>
+                <div style="font-weight:700; font-size:16px; margin-bottom:6px;">All Stock Tickers (Invested)</div>
+                <div class="muted" style="margin-bottom:8px;">Quick view: which tickers you have + how much $ you put in.</div>
+                <div class="block">{all_stocks_html if all_stocks_html else "<div class='muted'>No stock positions.</div>"}</div>
+              </div>
+            </div>
+          </div>
 
           <p class="muted">Click ticker for links page (News + SEC). Click <b>tv</b> to open TradingView.</p>
           <p class="muted">API: <code>/api/portfolio</code> • <code>/api/news</code> • <code>/api/sec</code> • <code>/api/daily-brief</code> • Debug: <code>/debug/mapping-last</code></p>
@@ -1084,6 +1385,7 @@ async def run_daily():
             "ai_brief": "",
             "news_cache": {},
             "sec_cache": {},
+            "tech_cache": {},
             "groups": {},
             "crypto_rows": [],
             "instrument_meta": {},
@@ -1103,15 +1405,19 @@ async def run_daily():
     # Group industry + crypto
     grouped, crypto_rows = group_rows(portfolio_rows)
 
-    # tickers for news/sec: stocks only (crypto excluded)
-    stock_tickers_for_news: List[str] = []
+    # tickers for tech/news/sec: stocks only (crypto excluded)
+    stock_tickers: List[str] = []
     for industry in grouped:
-        stock_tickers_for_news.extend(grouped[industry].get("tickers") or [])
-    stock_tickers_for_news = list(dict.fromkeys(stock_tickers_for_news))
+        stock_tickers.extend(grouped[industry].get("tickers") or [])
+    stock_tickers = list(dict.fromkeys(stock_tickers))
 
-    news_cache, sec_cache = await compute_news_and_sec(stock_tickers_for_news)
+    # TECH
+    tech_cache = await compute_tech_cache(stock_tickers)
 
-    technical_exceptions.append("Next: Monthly return, RSI, 200DMA, ATR%, liquidity + strict-mode fundamentals.")
+    # NEWS + SEC
+    news_cache, sec_cache = await compute_news_and_sec(stock_tickers)
+
+    technical_exceptions.append("If you see Tech NA: symbol not available on Stooq for that ticker format (e.g., non-US / OTC).")
     ai_brief = await generate_openai_brief(portfolio_rows) if portfolio_rows else "No positions."
 
     state.update({
@@ -1125,9 +1431,10 @@ async def run_daily():
         "mapping": {"requested": map_debug["requested"], "mapped": map_debug["mapped"]},
         "mapping_last_debug": map_debug,
         "instrument_meta": map_debug.get("instrument_meta") or {},
+        "tech_cache": tech_cache,
         "news_cache": news_cache,
         "sec_cache": sec_cache,
-        "tickers": stock_tickers_for_news,
+        "tickers": stock_tickers,
         "groups": grouped,
         "crypto_rows": crypto_rows,
         "energy_thesis": ENERGY_THESIS,
@@ -1139,8 +1446,9 @@ async def run_daily():
         "lots": stats["lots_count"],
         "unique_instruments": stats["unique_instruments_count"],
         "mapped_symbols": map_debug["mapped"],
-        "stock_tickers_news": len(stock_tickers_for_news),
+        "stock_tickers": len(stock_tickers),
         "crypto_positions": len(crypto_rows),
+        "tech_total": len(tech_cache),
         "news_total": sum(len(v) for v in news_cache.values()),
         "sec_total": sum(len(v) for v in sec_cache.values()),
     }
@@ -1157,6 +1465,7 @@ async def api_portfolio():
         "groups": state.get("groups") or {},
         "crypto_rows": state.get("crypto_rows") or [],
         "instrument_meta": state.get("instrument_meta") or {},
+        "tech_cache": state.get("tech_cache") or {},
     })
 
 
