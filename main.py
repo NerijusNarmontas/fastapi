@@ -3,13 +3,13 @@
 # - Pulls eToro REAL PnL + portfolio positions
 # - Aggregates by instrumentID
 # - Maps instrumentID -> ticker via eToro /market-data/search
-# - Separates Crypto vs Stocks
-# - Categorizes stocks into industry-like groups
-# - CLEAN dashboard (tables only; no bulky news blocks)
+# - Separates Crypto vs Stocks (crypto list includes your tickers)
+# - Categorizes stocks into industry-like groups (your manual mappings included)
+# - CLEAN dashboard (white background / black text)
 # - News/SEC links shown ONLY when you click a ticker:
-#     /t/{TICKER} opens a new page with all cached links for that ticker
-# - Fetches FREE news links (Google News RSS) per ticker (cached by /tasks/daily)
-# - Adds SEC links + short “resume” bullets (cached by /tasks/daily)
+#     /t/{TICKER} opens a new page with cached News + SEC links
+# - Adds a tiny superscript "tv" link next to each ticker to open TradingView live
+# - Fetches FREE news (Google News RSS) + SEC links (cached by /tasks/daily)
 #
 # Railway startCommand:
 #   hypercorn main:app --bind "0.0.0.0:$PORT"
@@ -22,7 +22,7 @@
 # Optional:
 #   OPENAI_API_KEY=... (optional AI brief; safe to leave empty)
 #   CRYPTO_EXCLUDE=W
-#   CRYPTO_TICKERS=BTC,ETH,... (extend list)
+#   CRYPTO_TICKERS=... (extend list)
 #   CRYPTO_INSTRUMENT_IDS=100000
 #   STATE_PATH=/tmp/investing_agent_state.json
 #   NEWS_PER_TICKER=6
@@ -86,12 +86,13 @@ CRYPTO_EXCLUDE = set(
     s.strip().upper() for s in os.getenv("CRYPTO_EXCLUDE", "W").split(",") if s.strip()
 )
 
-# crypto list (your list + extendable via env)
+# crypto list (includes your crypto tickers; extendable via env)
 CRYPTO_TICKERS = set(
     s.strip().upper()
     for s in os.getenv(
         "CRYPTO_TICKERS",
-        "BTC,ETH,SOL,AVAX,OP,ARB,JTO,RUNE,W,EIGEN,STRK,ONDO,SEI,WLD,PYTH,HBAR,CRO,HYPE,RPL,ARBE",
+        "BTC,ETH,SOL,AVAX,OP,ARB,JTO,RUNE,W,EIGEN,STRK,ONDO,"
+        "SEI,WLD,PYTH,HBAR,CRO,HYPE,RPL,ARBE",
     ).split(",")
     if s.strip()
 )
@@ -114,8 +115,6 @@ CONCURRENCY = int(os.getenv("CONCURRENCY", "10"))
 # ----------------------------
 # Your explicit mapping + core portfolio examples
 CATEGORY_OVERRIDES: Dict[str, Tuple[str, str]] = {
-    # Crypto are handled separately (not here)
-
     # Your explicit mapping
     "CEG": ("Energy", "Power / Nuclear-linked"),
     "BKSY": ("Space", "Earth Observation"),
@@ -304,18 +303,20 @@ def categorize_ticker(ticker: str) -> Tuple[str, str]:
         return CATEGORY_OVERRIDES[t]
 
     # conservative fallbacks
-    if t in ("CCJ", "UEC", "LEU", "SMR", "OKLO", "LTBR"):
+    if t in ("CCJ", "UEC", "LEU", "SMR", "OKLO", "LTBR", "FERMI", "BOE.ASX"):
         return ("Nuclear", "Nuclear")
     if t in ("ARQQ", "RGTI", "IONQ", "QBTS"):
         return ("Quantum", "Quantum")
     if t in ("BKSY", "SPIR", "RDW", "FLY"):
         return ("Space", "Space")
-    if t in ("AU", "NEM", "KGC", "SBSW", "RGLD", "MP"):
+    if t in ("RGLD", "AU", "NEM", "KGC", "SBSW", "MP"):
         return ("Miners", "Miners")
     if t in ("ABAT", "USAR", "TMC", "ALB"):
         return ("Rare Metals", "Materials")
-    if t in ("INTC", "S.US"):
-        return ("Tech", "Semis / Chips")
+    if t in ("INTC", "S.US", "CRWV"):
+        return ("Tech", "Tech")
+    if t.endswith(".US") and t.startswith("AR"):
+        return ("Gas", "Gas")
     return ("Other", "Unclassified")
 
 
@@ -362,6 +363,17 @@ def group_rows(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], L
 
     crypto_rows.sort(key=lambda x: float(x.get("weight_pct") or 0), reverse=True)
     return groups, crypto_rows
+
+
+def tradingview_url(ticker: str, exchange: str = "") -> str:
+    """
+    Prefer chart URL when exchange is known, otherwise fallback to symbol page.
+    """
+    t = normalize_ticker(ticker)
+    ex = (exchange or "").strip().upper()
+    if ex:
+        return f"https://www.tradingview.com/chart/?symbol={ex}:{t}"
+    return f"https://www.tradingview.com/symbols/{t}/"
 
 
 # ----------------------------
@@ -412,15 +424,30 @@ def _extract_ticker_from_search_item(item: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_exchange_from_search_item(item: Dict[str, Any]) -> str:
+    # Field names vary; try common possibilities.
+    for k in ("exchange", "exchangeName", "exchangeCode", "marketName", "market"):
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
 async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict[int, str], Dict[str, Any]]:
+    """
+    instrumentId -> ticker, and best-effort meta (exchange) for TradingView links.
+    Returns: ticker_map, debug (includes debug["instrument_meta"]).
+    """
     ids = sorted(set(int(x) for x in instrument_ids if x is not None))
     out: Dict[int, str] = {}
-    debug = {"requested": len(ids), "mapped": 0, "failed": 0, "samples": []}
+    instrument_meta: Dict[int, Dict[str, str]] = {}
+    debug: Dict[str, Any] = {"requested": len(ids), "mapped": 0, "failed": 0, "samples": []}
 
     sem = asyncio.Semaphore(10)
 
     async def one(iid: int):
         async with sem:
+            # Try instrumentId filter
             status, data = await etoro_search({"instrumentId": str(iid), "pageSize": "5", "pageNumber": "1"})
             items = data.get("items") if isinstance(data, dict) else None
             if isinstance(items, list) and items:
@@ -430,11 +457,14 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict
                     t = _extract_ticker_from_search_item(it)
                     if t:
                         out[iid] = t
+                        ex = _extract_exchange_from_search_item(it)
+                        instrument_meta[iid] = {"exchange": ex}
                         debug["mapped"] += 1
                         if len(debug["samples"]) < 10:
-                            debug["samples"].append({"instrumentID": iid, "ticker": t, "via": "instrumentId", "status": status})
+                            debug["samples"].append({"instrumentID": iid, "ticker": t, "exchange": ex, "via": "instrumentId", "status": status})
                         return
 
+            # Fallback: internalInstrumentId filter
             status2, data2 = await etoro_search({"internalInstrumentId": str(iid), "pageSize": "5", "pageNumber": "1"})
             items2 = data2.get("items") if isinstance(data2, dict) else None
             if isinstance(items2, list) and items2:
@@ -444,9 +474,11 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict
                     t = _extract_ticker_from_search_item(it)
                     if t:
                         out[iid] = t
+                        ex = _extract_exchange_from_search_item(it)
+                        instrument_meta[iid] = {"exchange": ex}
                         debug["mapped"] += 1
                         if len(debug["samples"]) < 10:
-                            debug["samples"].append({"instrumentID": iid, "ticker": t, "via": "internalInstrumentId", "status": status2})
+                            debug["samples"].append({"instrumentID": iid, "ticker": t, "exchange": ex, "via": "internalInstrumentId", "status": status2})
                         return
 
             debug["failed"] += 1
@@ -454,6 +486,7 @@ async def map_instrument_ids_to_tickers(instrument_ids: List[int]) -> Tuple[Dict
                 debug["samples"].append({"instrumentID": iid, "status": "no_match_or_no_ticker"})
 
     await asyncio.gather(*(one(i) for i in ids))
+    debug["instrument_meta"] = instrument_meta
     return out, debug
 
 
@@ -523,7 +556,7 @@ def resume_news(title: str) -> str:
         tags.append("Earnings / guidance")
     if any(k in t for k in ["acquire", "acquisition", "merger", "buyout", "takeover"]):
         tags.append("M&A")
-    if any(k in t for k in ["offering", "private placement", "convertible", "debt", "notes"]):
+    if any(k in t for k in ["offering", "private placement", "convertible", "debt", "notes", "atm", "shelf"]):
         tags.append("Financing")
     if any(k in t for k in ["contract", "award", "partnership", "collaboration"]):
         tags.append("Commercial deal")
@@ -592,7 +625,7 @@ def resume_sec(form: str) -> str:
         return "Quarterly report."
     if f == "10-K":
         return "Annual report."
-    if f in ("S-1", "F-1"):
+    if f in ("S-1", "F-1", "424B", "424B2", "424B3", "424B5"):
         return "Registration / offering."
     return "Filing update."
 
@@ -644,7 +677,7 @@ async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[D
             if not title or not link or link in seen:
                 continue
             seen.add(link)
-            m = re.search(r"\b(8-K|10-Q|10-K|S-1|F-1)\b", title, re.I)
+            m = re.search(r"\b(8-K|10-Q|10-K|S-1|F-1|424B\d*)\b", title, re.I)
             form = (m.group(1).upper() if m else "Filing")
             out.append({
                 "ticker": ticker,
@@ -752,6 +785,7 @@ async def dashboard():
 
     groups = state.get("groups") or {}          # {industry: {"rows":[], "tickers":[]}}
     crypto_rows = state.get("crypto_rows") or []
+    instrument_meta = state.get("instrument_meta") or {}  # {instrumentID: {"exchange": "..."}}
 
     def bullets(items: List[str]) -> str:
         lis = "".join([f"<li>{html_escape(x)}</li>" for x in items]) if items else "<li>None</li>"
@@ -766,9 +800,24 @@ async def dashboard():
                    "</tr></thead><tbody>")
         for r in rows[:200]:
             t = r.get("ticker", "")
+            iid = 0
+            try:
+                iid = int(r.get("instrumentID") or 0)
+            except Exception:
+                iid = 0
+
+            ex = (instrument_meta.get(str(iid)) or instrument_meta.get(iid) or {}).get("exchange", "")
+            tv = tradingview_url(t, ex)
+
             out.append(
                 "<tr>"
-                f"<td><a href='/t/{html_escape(t)}' target='_blank' rel='noopener noreferrer'>{html_escape(t)}</a></td>"
+                "<td>"
+                f"<a href='/t/{html_escape(t)}' target='_blank' rel='noopener noreferrer'>{html_escape(t)}</a>"
+                f"<sup style='margin-left:6px;'>"
+                f"<a href='{html_escape(tv)}' target='_blank' rel='noopener noreferrer' "
+                f"title='Open in TradingView' style='font-size:11px; text-decoration:none;'>tv</a>"
+                f"</sup>"
+                "</td>"
                 f"<td>{html_escape(r.get('lots',''))}</td>"
                 f"<td>{html_escape(r.get('weight_pct',''))}</td>"
                 f"<td>{html_escape(r.get('pnl_pct',''))}</td>"
@@ -777,7 +826,6 @@ async def dashboard():
         out.append("</tbody></table>")
         return "".join(out)
 
-    # Build industry sections (collapsible)
     category_html = ""
     for industry in ordered_industries(groups):
         rows = (groups.get(industry) or {}).get("rows") or []
@@ -794,7 +842,7 @@ async def dashboard():
         <details class="section">
           <summary>Crypto <span class="muted">({len(crypto_rows)} positions)</span></summary>
           <div class="block">{render_table(crypto_rows)}</div>
-          <div class="muted">Click a ticker to open its links page.</div>
+          <div class="muted">Crypto news/SEC not fetched by default. Click ticker for its links page, and “tv” for TradingView.</div>
         </details>
         """
 
@@ -872,7 +920,7 @@ async def dashboard():
           <h2>Stocks (industry groups)</h2>
           {category_html if category_html else "<div class='muted'>No categorized stock positions yet. Run /tasks/daily.</div>"}
 
-          <p class="muted">Click any ticker to open its links page (News + SEC).</p>
+          <p class="muted">Click ticker for links page (News + SEC). Click <b>tv</b> to open TradingView.</p>
           <p class="muted">API: <code>/api/portfolio</code> • <code>/api/news</code> • <code>/api/sec</code> • <code>/api/daily-brief</code> • Debug: <code>/debug/mapping-last</code></p>
         </div>
       </body>
@@ -891,6 +939,8 @@ async def ticker_page(ticker: str):
 
     news_items = (news_cache.get(t) or [])[:NEWS_PER_TICKER]
     sec_items = (sec_cache.get(t) or [])[:SEC_PER_TICKER]
+
+    tv = tradingview_url(t, "")
 
     def render_news():
         if not news_items:
@@ -982,6 +1032,7 @@ async def ticker_page(ticker: str):
           <div class="top">
             <h1 style="margin:0;">{html_escape(t)}</h1>
             <a class="btn" href="/" target="_self">Back</a>
+            <a class="btn" href="{html_escape(tv)}" target="_blank" rel="noopener noreferrer">Open TradingView</a>
             <span class="muted">Last update: {html_escape(state.get("date") or utc_now_iso())}</span>
           </div>
 
@@ -1035,6 +1086,7 @@ async def run_daily():
             "sec_cache": {},
             "groups": {},
             "crypto_rows": [],
+            "instrument_meta": {},
             "energy_thesis": ENERGY_THESIS,
         })
         save_state(state)
@@ -1042,7 +1094,7 @@ async def run_daily():
 
     instrument_ids = [int(x["instrumentID"]) for x in agg_positions if x.get("instrumentID") is not None]
 
-    # Map instrumentId -> ticker
+    # Map instrumentId -> ticker (+ exchange meta)
     ticker_map, map_debug = await map_instrument_ids_to_tickers(instrument_ids)
     material_events.append(f"Mapped tickers via search: {map_debug['mapped']}/{map_debug['requested']}")
 
@@ -1059,7 +1111,7 @@ async def run_daily():
 
     news_cache, sec_cache = await compute_news_and_sec(stock_tickers_for_news)
 
-    technical_exceptions.append("Next: RSI/MACD/MAs/Volume/ADV + liquidity flags.")
+    technical_exceptions.append("Next: Monthly return, RSI, 200DMA, ATR%, liquidity + strict-mode fundamentals.")
     ai_brief = await generate_openai_brief(portfolio_rows) if portfolio_rows else "No positions."
 
     state.update({
@@ -1072,10 +1124,11 @@ async def run_daily():
         "ai_brief": ai_brief,
         "mapping": {"requested": map_debug["requested"], "mapped": map_debug["mapped"]},
         "mapping_last_debug": map_debug,
+        "instrument_meta": map_debug.get("instrument_meta") or {},
         "news_cache": news_cache,
         "sec_cache": sec_cache,
         "tickers": stock_tickers_for_news,
-        "groups": grouped,          # already JSON-friendly
+        "groups": grouped,
         "crypto_rows": crypto_rows,
         "energy_thesis": ENERGY_THESIS,
     })
@@ -1103,6 +1156,7 @@ async def api_portfolio():
         "tickers": state.get("tickers") or [],
         "groups": state.get("groups") or {},
         "crypto_rows": state.get("crypto_rows") or [],
+        "instrument_meta": state.get("instrument_meta") or {},
     })
 
 
