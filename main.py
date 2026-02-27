@@ -1,25 +1,25 @@
 # main.py
-# FastAPI dashboard with:
-# - News links per ticker (Google News RSS + optional Bing News RSS style fallback)
-# - SEC filings links per ticker (EDGAR Atom feed; optional CIK-based feed if you provide mapping)
-# - Short “resume” bullets (heuristic summaries; no full-text scraping)
+# Paste this as your ONLY main.py.
+# Railway startCommand should be: hypercorn main:app --bind "0.0.0.0:$PORT"
 #
-# NOTES
-# - Google News RSS can block generic bots: we send a real User-Agent.
-# - SEC requires a descriptive User-Agent header.
-# - This file is self-contained; you can later plug your eToro/stooq pipeline back in.
+# What you MUST set in Railway Variables:
+#   TICKERS = EQT,CIVI,DVN,SM,NOG,CCJ,LEU,SMR,OKLO,EPD,WMB,... (your stocks)
+# Optional:
+#   CRYPTO_EXCLUDE = W (comma-separated tickers you want to ignore)
+#   NEWS_PER_TICKER = 6
+#   SEC_PER_TICKER = 6
+#   SEC_UA = "YourName AppName (email@domain.com)"   # important for SEC
+#   DEFAULT_UA = "...browser UA..."                  # helps Google News RSS
+#   CIK_MAP = {"AAPL":"0000320193","MSFT":"0000789019"}  # optional for richer SEC per ticker
 #
-# Run locally:
-#   uvicorn main:app --reload --port 8000
-#
-# Railway:
-#   Start command: uvicorn main:app --host 0.0.0.0 --port $PORT
+# After deploy:
+#   1) open /tasks/daily once
+#   2) open /  (dashboard)
+#   3) open /api/news if you want raw JSON
 
 import os
 import re
 import json
-import math
-import time
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,53 +31,38 @@ import httpx
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-# ----------------------------
-# Config
-# ----------------------------
-
 APP_NAME = "Investing Dashboard"
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/investing_agent_state.json")
 
-# If you already have a ticker universe (from eToro positions), you can pass it via env:
-# TICKERS="EQT,SM,CCJ,LEU,SMR,OKLO,EPD"
+# --- Core inputs ---
 TICKERS_ENV = os.getenv("TICKERS", "").strip()
-
-# Exclude crypto symbols that collide with stocks (example from your note: W=Wormhole)
 CRYPTO_EXCLUDE = set(
-    s.strip().upper()
-    for s in os.getenv("CRYPTO_EXCLUDE", "W").split(",")
-    if s.strip()
+    s.strip().upper() for s in os.getenv("CRYPTO_EXCLUDE", "W").split(",") if s.strip()
 )
 
-# Limits
+# --- Limits / perf ---
 NEWS_PER_TICKER = int(os.getenv("NEWS_PER_TICKER", "6"))
 SEC_PER_TICKER = int(os.getenv("SEC_PER_TICKER", "6"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "10"))
 
-# User-Agent headers (important)
+# --- User-Agent headers (important) ---
 DEFAULT_UA = os.getenv(
     "DEFAULT_UA",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
 )
-
-# SEC asks for: Company Name + email/phone (or at least something descriptive)
 SEC_UA = os.getenv(
     "SEC_UA",
     "NerijusNarmontas fastapi-investing-dashboard (contact: nerijus@example.com)",
 )
 
-# If you want better SEC results (CIK-based), you can provide a simple map:
-# CIK_MAP='{"AAPL":"0000320193","MSFT":"0000789019"}'
 CIK_MAP_JSON = os.getenv("CIK_MAP", "").strip()
 
-# ----------------------------
-# State
-# ----------------------------
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_PATH):
@@ -88,46 +73,31 @@ def load_state() -> Dict[str, Any]:
     except Exception:
         return {}
 
+
 def save_state(state: Dict[str, Any]) -> None:
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_PATH)
 
-STATE: Dict[str, Any] = load_state()
 
-# Initialize expected keys
+STATE: Dict[str, Any] = load_state()
 STATE.setdefault("tickers", [])
-STATE.setdefault("news_cache", {})     # {ticker: [items]}
-STATE.setdefault("sec_cache", {})      # {ticker: [items]}
+STATE.setdefault("news_cache", {})  # {ticker: [items]}
+STATE.setdefault("sec_cache", {})   # {ticker: [items]}
 STATE.setdefault("last_run", None)
 STATE.setdefault("debug", {})
 
-# ----------------------------
-# Utilities
-# ----------------------------
 
 def normalize_ticker(t: str) -> str:
     t = (t or "").strip().upper()
-    # Basic cleanup
     t = re.sub(r"[^A-Z0-9\.\-]", "", t)
     return t
 
-def dedupe_by_key(items: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
-    seen = set()
-    out = []
-    for it in items:
-        v = (it.get(key) or "").strip()
-        if not v:
-            continue
-        if v in seen:
-            continue
-        seen.add(v)
-        out.append(it)
-    return out
 
 def safe_text(x: Optional[str]) -> str:
     return (x or "").replace("\x00", "").strip()
+
 
 def html_escape(s: str) -> str:
     return (
@@ -137,30 +107,27 @@ def html_escape(s: str) -> str:
          .replace('"', "&quot;")
     )
 
-def iso_to_localish(iso_str: str) -> str:
-    # Keep it simple: show ISO date if parseable
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        return iso_str
 
-# ----------------------------
-# RSS / Atom parsing
-# ----------------------------
+def dedupe_by_key(items: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for it in items:
+        v = (it.get(key) or "").strip()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        out.append(it)
+    return out
 
-def parse_rss_items(xml_text: str) -> List[Dict[str, Any]]:
-    """
-    Works for RSS 2.0 and some Atom-like feeds.
-    Returns list of dict: title, link, published, source
-    """
+
+def parse_rss_or_atom(xml_text: str) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     try:
         root = ET.fromstring(xml_text)
     except Exception:
         return items
 
-    # RSS: channel/item
+    # RSS2: channel/item
     channel = root.find("channel")
     if channel is not None:
         for item in channel.findall("item"):
@@ -172,11 +139,9 @@ def parse_rss_items(xml_text: str) -> List[Dict[str, Any]]:
         return items
 
     # Atom: entry
-    ns = {"atom": "http://www.w3.org/2005/Atom"}
     for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry"):
         title = safe_text(entry.findtext("{http://www.w3.org/2005/Atom}title"))
         updated = safe_text(entry.findtext("{http://www.w3.org/2005/Atom}updated"))
-        # link can be in <link href="..."/>
         link = ""
         link_el = entry.find("{http://www.w3.org/2005/Atom}link")
         if link_el is not None and "href" in link_el.attrib:
@@ -184,30 +149,12 @@ def parse_rss_items(xml_text: str) -> List[Dict[str, Any]]:
         items.append({"title": title, "link": link, "published_raw": updated, "source": ""})
     return items
 
-# ----------------------------
-# News sources
-# ----------------------------
-
-@dataclass
-class NewsItem:
-    ticker: str
-    title: str
-    link: str
-    source: str
-    published: str
-    resume: str
 
 def resume_news(title: str) -> str:
-    """
-    Heuristic “resume” for key events.
-    No full-text reading; just a short classification.
-    """
     t = (title or "").lower()
     tags = []
     if any(k in t for k in ["earnings", "q1", "q2", "q3", "q4", "guidance", "revenue", "eps"]):
         tags.append("Earnings / guidance")
-    if any(k in t for k in ["sec", "8-k", "10-q", "10-k", "s-1", "f-1", "prospectus"]):
-        tags.append("Regulatory / filing")
     if any(k in t for k in ["acquire", "acquisition", "merger", "buyout", "takeover"]):
         tags.append("M&A")
     if any(k in t for k in ["offering", "private placement", "convertible", "debt", "notes"]):
@@ -218,60 +165,43 @@ def resume_news(title: str) -> str:
         tags.append("Legal / investigation")
     if any(k in t for k in ["upgrade", "downgrade", "price target", "analyst"]):
         tags.append("Analyst move")
-    if any(k in t for k in ["production", "plant", "factory", "permit", "approval", "license"]):
-        tags.append("Ops / approvals")
+    if any(k in t for k in ["permit", "approval", "license", "regulator"]):
+        tags.append("Approvals / regulatory")
+    return " | ".join(tags) if tags else "Headline update (skim if position is meaningful)."
 
-    if not tags:
-        return "Headline update (read if position is large or volatility is high)."
-    return " | ".join(tags)
 
-async def fetch_google_news_rss(client: httpx.AsyncClient, ticker: str) -> List[NewsItem]:
-    # Google News RSS query: ticker + stock
-    q = quote_plus(f"{ticker} stock")
-    url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+def resume_sec(form: str, title: str) -> str:
+    f = (form or "").upper().strip()
+    if f == "8-K":
+        return "Material event. Check for earnings release, financing, M&A, leadership changes, major contracts."
+    if f == "10-Q":
+        return "Quarterly report. Focus on margins, cash burn/FCF, guidance, balance sheet."
+    if f == "10-K":
+        return "Annual report. Risks/business changes; liquidity, segment performance."
+    if f in ("S-1", "F-1"):
+        return "Registration/IPO. Dilution risk; read use-of-proceeds and offering terms."
+    if f.startswith("S-") or f.startswith("F-"):
+        return "Registration statement. Often issuance/resale; dilution risk."
+    if f.startswith("424B"):
+        return "Prospectus supplement. Financing details; pricing and dilution."
+    if f in ("SC 13D", "SC13D"):
+        return "Activist/large holder filing. Can be catalytic; check intent and stake change."
+    if f in ("SC 13G", "SC13G"):
+        return "Passive holder filing. Useful sentiment signal."
+    if f in ("DEF 14A", "DEFA14A"):
+        return "Proxy. Governance/compensation; can signal strategic shifts."
+    return "Filing update. Open link and skim cover + key sections."
 
-    try:
-        r = await client.get(
-            url,
-            headers={
-                "accept": "application/rss+xml, text/xml;q=0.9,*/*;q=0.8",
-                "user-agent": DEFAULT_UA,
-            },
-        )
-        if r.status_code != 200:
-            return []
-        raw_items = parse_rss_items(r.text)
-    except Exception:
-        return []
 
-    out: List[NewsItem] = []
-    for it in raw_items[: NEWS_PER_TICKER * 2]:
-        title = safe_text(it.get("title"))
-        link = safe_text(it.get("link"))
-        if not title or not link:
-            continue
-        source = safe_text(it.get("source")) or "Google News"
-        published = safe_text(it.get("published_raw")) or ""
-        out.append(
-            NewsItem(
-                ticker=ticker,
-                title=title,
-                link=link,
-                source=source,
-                published=published,
-                resume=resume_news(title),
-            )
-        )
-    # Dedupe by link and cut
-    deduped = dedupe_by_key([x.__dict__ for x in out], "link")
-    return [NewsItem(**x) for x in deduped[:NEWS_PER_TICKER]]
+@dataclass
+class NewsItem:
+    ticker: str
+    title: str
+    link: str
+    source: str
+    published_raw: str
+    resume: str
 
-# Optional fallback: a second RSS-like source is tricky without paid APIs.
-# Keep it simple: Google News is usually enough if UA is correct.
-
-# ----------------------------
-# SEC filings (links + short resumes)
-# ----------------------------
 
 @dataclass
 class SecItem:
@@ -282,35 +212,67 @@ class SecItem:
     filed: str
     resume: str
 
-def resume_sec(form: str, title: str) -> str:
-    f = (form or "").upper().strip()
-    # Fast, traditional “what matters” mapping
-    if f == "8-K":
-        return "Material event. Check for earnings release, financing, M&A, leadership changes, or material agreements."
-    if f in ("10-Q",):
-        return "Quarterly report. Look for margins, cash burn/FCF, guidance, and risk updates."
-    if f in ("10-K",):
-        return "Annual report. Business/risk overhaul; focus on liquidity, going-concern, segment performance."
-    if f in ("S-1", "F-1"):
-        return "IPO/registration. Dilution & selling pressure risk; read use-of-proceeds and underwriting."
-    if f.startswith("S-") or f.startswith("F-"):
-        return "Registration statement. Often relates to issuance/resales; dilution risk."
-    if f in ("424B", "424B2", "424B3", "424B4", "424B5"):
-        return "Prospectus/prospectus supplement. Usually financing details; check pricing and dilution."
-    if f in ("SC 13D", "SC13D", "13D"):
-        return "Activist/large holder filing. Can move the stock; watch intent and ownership changes."
-    if f in ("SC 13G", "SC13G", "13G"):
-        return "Passive large holder filing. Useful sentiment signal; usually less catalytic than 13D."
-    if f in ("DEF 14A", "DEFA14A"):
-        return "Proxy statement. Compensation, votes, governance; can hint at strategic shifts."
-    return "Filing update. Open link and skim the cover + key sections."
 
-async def fetch_sec_atom_by_ticker(client: httpx.AsyncClient, ticker: str) -> List[SecItem]:
-    """
-    SEC provides an Atom feed by 'CIK' reliably.
-    Ticker-based atom feeds exist for some endpoints, but CIK is safer.
-    If you don't provide CIK_MAP, we fall back to a broad EDGAR search link list (no atom parsing).
-    """
+def get_tickers() -> List[str]:
+    base: List[str] = []
+    # Prefer STATE tickers if already populated
+    if isinstance(STATE.get("tickers"), list) and STATE["tickers"]:
+        base = [normalize_ticker(x) for x in STATE["tickers"]]
+    elif TICKERS_ENV:
+        base = [normalize_ticker(x) for x in TICKERS_ENV.split(",")]
+
+    out: List[str] = []
+    for t in base:
+        if not t:
+            continue
+        if t in CRYPTO_EXCLUDE:
+            continue
+        out.append(t)
+
+    # de-dupe stable
+    seen = set()
+    uniq = []
+    for t in out:
+        if t not in seen:
+            uniq.append(t)
+            seen.add(t)
+    return uniq
+
+
+async def fetch_google_news_rss(client: httpx.AsyncClient, ticker: str) -> List[NewsItem]:
+    q = quote_plus(f"{ticker} stock")
+    url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+    r = await client.get(
+        url,
+        headers={
+            "accept": "application/rss+xml, text/xml;q=0.9,*/*;q=0.8",
+            "user-agent": DEFAULT_UA,
+        },
+    )
+    if r.status_code != 200:
+        return []
+    raw = parse_rss_or_atom(r.text)
+    out: List[NewsItem] = []
+    for it in raw[: NEWS_PER_TICKER * 3]:
+        title = safe_text(it.get("title"))
+        link = safe_text(it.get("link"))
+        if not title or not link:
+            continue
+        out.append(
+            NewsItem(
+                ticker=ticker,
+                title=title,
+                link=link,
+                source=safe_text(it.get("source")) or "Google News",
+                published_raw=safe_text(it.get("published_raw")) or "",
+                resume=resume_news(title),
+            )
+        )
+    dedup = dedupe_by_key([x.__dict__ for x in out], "link")
+    return [NewsItem(**x) for x in dedup[:NEWS_PER_TICKER]]
+
+
+async def fetch_sec_for_ticker(client: httpx.AsyncClient, ticker: str) -> List[SecItem]:
     cik_map: Dict[str, str] = {}
     if CIK_MAP_JSON:
         try:
@@ -321,38 +283,36 @@ async def fetch_sec_atom_by_ticker(client: httpx.AsyncClient, ticker: str) -> Li
     cik = (cik_map.get(ticker) or "").strip()
     if cik:
         cik = cik.zfill(10)
-        url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=&dateb=&owner=exclude&count=40&output=atom"
-        try:
-            r = await client.get(
-                url,
-                headers={
-                    "accept": "application/atom+xml, application/xml;q=0.9,*/*;q=0.8",
-                    "user-agent": SEC_UA,
-                },
-            )
-            if r.status_code != 200:
-                return []
-            raw_items = parse_rss_items(r.text)  # Atom entries
-        except Exception:
+        url = (
+            "https://www.sec.gov/cgi-bin/browse-edgar"
+            f"?action=getcompany&CIK={cik}&owner=exclude&count=40&output=atom"
+        )
+        r = await client.get(
+            url,
+            headers={
+                "accept": "application/atom+xml, application/xml;q=0.9,*/*;q=0.8",
+                "user-agent": SEC_UA,
+            },
+        )
+        if r.status_code != 200:
             return []
+        raw = parse_rss_or_atom(r.text)
 
         out: List[SecItem] = []
-        for it in raw_items[: SEC_PER_TICKER * 2]:
+        for it in raw[: SEC_PER_TICKER * 3]:
             title = safe_text(it.get("title"))
             link = safe_text(it.get("link"))
             filed = safe_text(it.get("published_raw")) or ""
-            # Atom entry title often contains form + company name; try to pull the form
-            # Example patterns vary; keep it conservative.
+            if not title or not link:
+                continue
+
             form = ""
             m = re.search(r"\b(8-K|10-Q|10-K|S-1|F-1|424B\d*|DEF\s*14A|SC\s*13D|SC\s*13G)\b", title, re.I)
             if m:
-                form = m.group(1).replace(" ", "").upper()
-                if form == "SC13D":
-                    form = "SC 13D"
-                if form == "SC13G":
-                    form = "SC 13G"
-                if form.startswith("DEF"):
-                    form = "DEF 14A"
+                form = m.group(1).upper().replace("  ", " ").strip()
+                if form.startswith("SC"):
+                    form = form.replace("SC", "SC ").replace("  ", " ").strip()
+
             out.append(
                 SecItem(
                     ticker=ticker,
@@ -363,101 +323,65 @@ async def fetch_sec_atom_by_ticker(client: httpx.AsyncClient, ticker: str) -> Li
                     resume=resume_sec(form or "", title),
                 )
             )
-        deduped = dedupe_by_key([x.__dict__ for x in out], "link")
-        return [SecItem(**x) for x in deduped[:SEC_PER_TICKER]]
+        dedup = dedupe_by_key([x.__dict__ for x in out], "link")
+        return [SecItem(**x) for x in dedup[:SEC_PER_TICKER]]
 
-    # Fallback: provide EDGAR search link without feed parsing
-    # (Still gives you clickable “SEC filings” even without CIK mapping.)
-    search_link = f"https://www.sec.gov/edgar/search/#/q={quote_plus(ticker)}&category=custom&forms=8-K%252C10-Q%252C10-K%252CS-1%252CF-1&sort=desc"
+    # fallback: still give you a clickable EDGAR search (no parsing)
+    search_link = f"https://www.sec.gov/edgar/search/#/q={quote_plus(ticker)}&sort=desc"
     return [
         SecItem(
             ticker=ticker,
             form="EDGAR",
-            title=f"EDGAR search for {ticker} (8-K/10-Q/10-K/S-1/F-1)",
+            title=f"EDGAR search for {ticker}",
             link=search_link,
             filed="",
-            resume="Click to see latest filings. If you want richer per-form lists, provide CIK_MAP env var.",
+            resume="Click to see latest filings. For richer per-form lists, set CIK_MAP (ticker→CIK).",
         )
     ]
 
-# ----------------------------
-# Tickers (plug your eToro pipeline here later)
-# ----------------------------
-
-def get_tickers() -> List[str]:
-    # Priority:
-    # 1) Previously saved tickers in STATE (from /tasks/daily or your pipeline)
-    # 2) TICKERS env
-    base: List[str] = []
-    if isinstance(STATE.get("tickers"), list) and STATE["tickers"]:
-        base = [normalize_ticker(x) for x in STATE["tickers"]]
-    elif TICKERS_ENV:
-        base = [normalize_ticker(x) for x in TICKERS_ENV.split(",")]
-
-    # Filter empties + crypto collisions
-    out = []
-    for t in base:
-        if not t:
-            continue
-        if t in CRYPTO_EXCLUDE:
-            continue
-        out.append(t)
-    # De-dupe stable
-    seen = set()
-    uniq = []
-    for t in out:
-        if t not in seen:
-            uniq.append(t)
-            seen.add(t)
-    return uniq
-
-# ----------------------------
-# Daily task
-# ----------------------------
 
 async def run_daily_refresh() -> Dict[str, Any]:
     tickers = get_tickers()
     started = now_utc_iso()
-
     sem = asyncio.Semaphore(CONCURRENCY)
-
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-
-        async def guarded_news(t: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
-            async with sem:
-                try:
-                    items = await fetch_google_news_rss(client, t)
-                    return t, [x.__dict__ for x in items], None
-                except Exception as e:
-                    return t, [], f"news_error: {type(e).__name__}"
-
-        async def guarded_sec(t: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
-            async with sem:
-                try:
-                    items = await fetch_sec_atom_by_ticker(client, t)
-                    return t, [x.__dict__ for x in items], None
-                except Exception as e:
-                    return t, [], f"sec_error: {type(e).__name__}"
-
-        news_tasks = [guarded_news(t) for t in tickers]
-        sec_tasks = [guarded_sec(t) for t in tickers]
-
-        news_results = await asyncio.gather(*news_tasks)
-        sec_results = await asyncio.gather(*sec_tasks)
 
     news_cache: Dict[str, Any] = {}
     sec_cache: Dict[str, Any] = {}
     errors: List[str] = []
 
-    for t, items, err in news_results:
-        news_cache[t] = items
-        if err:
-            errors.append(f"{t}: {err}")
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
 
-    for t, items, err in sec_results:
+        async def gn(t: str) -> Tuple[str, List[Dict[str, Any]]]:
+            async with sem:
+                items = await fetch_google_news_rss(client, t)
+                return t, [x.__dict__ for x in items]
+
+        async def sec(t: str) -> Tuple[str, List[Dict[str, Any]]]:
+            async with sem:
+                items = await fetch_sec_for_ticker(client, t)
+                return t, [x.__dict__ for x in items]
+
+        # run
+        tasks_news = [gn(t) for t in tickers]
+        tasks_sec = [sec(t) for t in tickers]
+
+        try:
+            news_results = await asyncio.gather(*tasks_news)
+        except Exception as e:
+            news_results = []
+            errors.append(f"news_gather: {type(e).__name__}")
+
+        try:
+            sec_results = await asyncio.gather(*tasks_sec)
+        except Exception as e:
+            sec_results = []
+            errors.append(f"sec_gather: {type(e).__name__}")
+
+    for t, items in news_results:
+        news_cache[t] = items
+
+    for t, items in sec_results:
         sec_cache[t] = items
-        if err:
-            errors.append(f"{t}: {err}")
 
     STATE["tickers"] = tickers
     STATE["news_cache"] = news_cache
@@ -469,28 +393,25 @@ async def run_daily_refresh() -> Dict[str, Any]:
         "news_total": sum(len(v) for v in news_cache.values()),
         "sec_total": sum(len(v) for v in sec_cache.values()),
         "errors": errors[:50],
+        "note": "If tickers=0, set Railway env var TICKERS.",
     }
     save_state(STATE)
     return STATE["debug"]
 
-# ----------------------------
-# FastAPI app
-# ----------------------------
 
 app = FastAPI(title=APP_NAME)
+
 
 @app.get("/health", response_class=PlainTextResponse)
 def health() -> str:
     return "ok"
 
+
 @app.get("/tasks/daily", response_class=JSONResponse)
 async def tasks_daily() -> Dict[str, Any]:
-    """
-    Trigger refresh (news + SEC).
-    In production, call this from a scheduler (Railway cron / GitHub Actions / external cron).
-    """
     dbg = await run_daily_refresh()
     return {"status": "ok", "debug": dbg}
+
 
 @app.get("/api/news", response_class=JSONResponse)
 def api_news(ticker: Optional[str] = None) -> Dict[str, Any]:
@@ -498,8 +419,9 @@ def api_news(ticker: Optional[str] = None) -> Dict[str, Any]:
     cache = STATE.get("news_cache", {}) or {}
     if ticker:
         t = normalize_ticker(ticker)
-        return {"ticker": t, "items": cache.get(t, []), "last_run": STATE.get("last_run")}
+        return {"ticker": t, "items": cache.get(t, []), "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
     return {"tickers": tickers, "news_cache": cache, "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
+
 
 @app.get("/api/sec", response_class=JSONResponse)
 def api_sec(ticker: Optional[str] = None) -> Dict[str, Any]:
@@ -507,27 +429,24 @@ def api_sec(ticker: Optional[str] = None) -> Dict[str, Any]:
     cache = STATE.get("sec_cache", {}) or {}
     if ticker:
         t = normalize_ticker(ticker)
-        return {"ticker": t, "items": cache.get(t, []), "last_run": STATE.get("last_run")}
+        return {"ticker": t, "items": cache.get(t, []), "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
     return {"tickers": tickers, "sec_cache": cache, "last_run": STATE.get("last_run"), "debug": STATE.get("debug", {})}
 
-# ----------------------------
-# Dashboard HTML
-# ----------------------------
 
-def render_cards_for_ticker(t: str) -> str:
+def render_ticker_card(t: str) -> str:
     news_items = (STATE.get("news_cache", {}) or {}).get(t, [])[:NEWS_PER_TICKER]
     sec_items = (STATE.get("sec_cache", {}) or {}).get(t, [])[:SEC_PER_TICKER]
 
     def news_html() -> str:
         if not news_items:
-            return "<div class='muted'>No news cached. Run <code>/tasks/daily</code>.</div>"
+            return "<div class='muted'>No news cached yet. Run <code>/tasks/daily</code>.</div>"
         rows = []
         for it in news_items:
             title = html_escape(safe_text(it.get("title")))
             link = html_escape(safe_text(it.get("link")))
             source = html_escape(safe_text(it.get("source")) or "Source")
-            pub = html_escape(safe_text(it.get("published_raw")))
-            resume = html_escape(safe_text(it.get("resume")))
+            pub = html_escape(safe_text(it.get("published_raw")) or "")
+            resume = html_escape(safe_text(it.get("resume")) or "")
             rows.append(
                 f"""
                 <div class="item">
@@ -541,7 +460,7 @@ def render_cards_for_ticker(t: str) -> str:
 
     def sec_html() -> str:
         if not sec_items:
-            return "<div class='muted'>No SEC cached. Run <code>/tasks/daily</code>. For richer lists, set <code>CIK_MAP</code>.</div>"
+            return "<div class='muted'>No SEC cached yet. Run <code>/tasks/daily</code>.</div>"
         rows = []
         for it in sec_items:
             title = html_escape(safe_text(it.get("title")))
@@ -581,15 +500,25 @@ def render_cards_for_ticker(t: str) -> str:
     </div>
     """
 
+
 @app.get("/", response_class=HTMLResponse)
-def dashboard(limit: int = Query(40, ge=1, le=300)) -> str:
+def dashboard(limit: int = Query(60, ge=1, le=500)) -> str:
     tickers = get_tickers()[:limit]
     last_run = STATE.get("last_run") or "never"
     dbg = STATE.get("debug", {}) or {}
 
-    cards = "\n".join(render_cards_for_ticker(t) for t in tickers) if tickers else (
-        "<div class='muted'>No tickers found. Set <code>TICKERS</code> env or run your pipeline to populate STATE['tickers'].</div>"
-    )
+    if not tickers:
+        body = """
+        <div class="card">
+          <div class="muted">
+            No tickers found.<br/>
+            Set Railway Variable <code>TICKERS</code> like: <code>EQT,SM,CCJ,LEU</code><br/>
+            Then run <code>/tasks/daily</code>.
+          </div>
+        </div>
+        """
+    else:
+        body = "\n".join(render_ticker_card(t) for t in tickers)
 
     return f"""
 <!doctype html>
@@ -618,7 +547,6 @@ def dashboard(limit: int = Query(40, ge=1, le=300)) -> str:
     .section-title {{ font-size: 12px; text-transform: uppercase; letter-spacing: .12em; color: #9fb0c0; margin: 4px 0 10px; }}
     .item {{ padding: 10px; border: 1px solid #1f2a37; border-radius: 12px; margin-bottom: 10px; background: #0b111a; }}
     .title {{ font-size: 13px; line-height: 1.25; margin-bottom: 6px; }}
-    .meta {{ font-size: 12px; color: #9fb0c0; }}
     .resume {{ font-size: 12px; margin-top: 6px; color: #c6d2dd; }}
     code {{ background: #0b111a; border: 1px solid #1f2a37; padding: 2px 6px; border-radius: 8px; color: #cfe2ff; }}
     .badge {{ display:inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid #314055; color: #cfe2ff; margin-right: 6px; }}
@@ -642,19 +570,15 @@ def dashboard(limit: int = Query(40, ge=1, le=300)) -> str:
       Debug: news_total={dbg.get("news_total","?")} · sec_total={dbg.get("sec_total","?")} · errors={len(dbg.get("errors",[]))}
     </div>
 
-    {cards}
+    {body}
 
     <div class="meta" style="margin-top:18px;">
-      Tip: For richer SEC lists per ticker, set env <code>CIK_MAP</code> (ticker→CIK). Example:
-      <code>{{"AAPL":"0000320193","MSFT":"0000789019"}}</code>
+      If SEC looks too thin: set <code>CIK_MAP</code> (ticker→CIK). SEC also needs <code>SEC_UA</code>.
     </div>
   </div>
 </body>
 </html>
 """
 
-# ----------------------------
-# Small helpers for you later
-# ----------------------------
-# You can replace get_tickers() by your eToro positions ticker extraction,
-# then set STATE["tickers"] = those tickers inside /tasks/daily before refresh.
+
+# End of file.
